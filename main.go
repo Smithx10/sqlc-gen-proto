@@ -19,11 +19,7 @@ import (
 )
 
 func main() {
-	g := Generator{
-		requiredImports: make(map[string]string),
-		outputs:         make(map[string]output),
-	}
-	if err := g.run(); err != nil {
+	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "error generating JSON: %s", err)
 		os.Exit(2)
 	}
@@ -259,42 +255,33 @@ func getGenerateOpts(comments []string) (*generateOpts, error) {
 	return g, nil
 }
 
-type Generator struct {
-	// [prototype]importpath
-	// ["google.protobuf.StringValue"] = "google/protobuf/wrappers.proto"
-
-	requiredImports map[string]string
-	outputs         map[string]output
-}
-
 type HeaderInput struct {
 	PackageName string
 	Imports     map[string]string
 }
 
-type output struct {
-	header      bytes.Buffer
-	msgs        bytes.Buffer
-	folderPath  string
-	packagename string
-	filename    string
+type protofile struct {
+	header          *bytes.Buffer
+	msgs            *bytes.Buffer
+	folderPath      string
+	packagename     string
+	filename        string
+	requiredImports map[string]string
 }
 
 func pkgToPath(s string) string {
 	return strings.ReplaceAll(s, ".", "/")
 }
 
-func (g *Generator) run() error {
+func run() error {
+	protofiles := make(map[string]protofile)
 	var req plugin.GenerateRequest
-	// var plg *protogen.Plugin
-	// Used for Writing out the Proto Files
-	// var printer protoprint.Printer
+
 	reqBlob, err := io.ReadAll(os.Stdin)
 	if err != nil {
 		return err
 	}
 
-	// req.PluginOptions
 	if err := proto.Unmarshal(reqBlob, &req); err != nil {
 		return err
 	}
@@ -327,28 +314,30 @@ func (g *Generator) run() error {
 
 			msgs := bytes.Buffer{}
 			header := bytes.Buffer{}
+			file := protofile{
+				folderPath:      opts.OutputDirectory + "/" + pkgToPath(opts.Package),
+				packagename:     opts.Package,
+				filename:        opts.FileName,
+				msgs:            &msgs,
+				header:          &header,
+				requiredImports: make(map[string]string),
+			}
 
-			msgInput := g.toMsgInput(t, opts)
+			msgInput := file.toMsgInput(t, opts)
 			if err := msgTmpl.Execute(&msgs, msgInput); err != nil {
 				return err
 			}
 
-			g.outputs[opts.Package] = output{
-				folderPath:  opts.OutputDirectory + "/" + pkgToPath(opts.Package),
-				packagename: opts.Package,
-				filename:    opts.FileName,
-				msgs:        msgs,
-				header:      header,
-			}
+			protofiles[opts.Package] = file
 		}
 	}
 
-	for pkg, output := range g.outputs {
+	for pkg, output := range protofiles {
 		header := output.header
 		msgs := output.msgs
-		if err := headerTmpl.Execute(&header, &HeaderInput{
+		if err := headerTmpl.Execute(header, &HeaderInput{
 			PackageName: pkg,
-			Imports:     g.requiredImports,
+			Imports:     output.requiredImports,
 		}); err != nil {
 			return err
 		}
@@ -409,7 +398,7 @@ func fieldName(s string) string {
 	return s
 }
 
-func (g *Generator) toMsgInput(tbl *plugin.Table, genOpts *generateOpts) msgInput {
+func (g *protofile) toMsgInput(tbl *plugin.Table, genOpts *generateOpts) msgInput {
 	m := msgInput{Name: protoName(tbl.Rel.Name)}
 	for _, c := range tbl.Columns {
 		f := Field{}
@@ -474,7 +463,7 @@ func requiredImport(s string) bool {
 	return true
 }
 
-func (g *Generator) pgTypeToProtoType(col *plugin.Column) string {
+func (g *protofile) pgTypeToProtoType(col *plugin.Column) string {
 	columnType := sdk.DataType(col.Type)
 	notNull := col.NotNull || col.IsArray
 	// driver := parseDriver(options./*  */SqlPackage)

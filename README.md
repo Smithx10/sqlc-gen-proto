@@ -81,7 +81,6 @@ package sqlcgen;
 
 import "google/protobuf/wrappers";
 import "google/protobuf/timestamp";
-import "google/type/expr.proto";
 
 message Users  {
 
@@ -108,9 +107,6 @@ syntax = "proto3";
 
 package foo.bar.baz.v1;
 
-import "google/protobuf/wrappers";
-import "google/protobuf/timestamp";
-import "google/type/expr.proto";
 
 message GroupMembers  {
 
