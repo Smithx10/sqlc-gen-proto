@@ -1,16 +1,16 @@
 # sqlc-gen-proto Generates .proto files
 
 
-### Current Options:
-#### --generate
+### Current Comment Annotation Options:
+#### -- generate:
 
-#### --package
+#### -- package:
 
-#### --replace
+#### -- replace:
 
-#### --outdir
+#### -- outdir:
 
-#### --filename
+#### -- filename:
 
 
 
