@@ -24,6 +24,7 @@ This takes care of keeping the messages in the database and the messages deliver
 | "outdir" | "./sqlcgen'"|
 |"filename" for enums | "enum.proto" |
 |"filename" for messages | "message.proto" |
+| "messagename" | tablename |
 
 
 #### -- generate:
@@ -32,20 +33,40 @@ This takes care of keeping the messages in the database and the messages deliver
 #### -- package:
 *"-- package:"*  specifies the package for the given protobuf file.
 
-#### -- replace:
-*"-- replace:"*  can be applied to a single field to replace its type and import path.
-
 #### -- outdir:
 *"-- outdir:"*  specifies the base directory where the package hierarchy will be created.
 
-#### -- skip: TODO
-*"-- skip:"*  can be applied to a single field to indicate you'd like to not include it in the message.
+#### -- skip:
+*"-- skip:"*  can be applied to a single field to indicate you'd like to not include it in the message.  By default all columns in both queries and tables are added. *can be annotated many times above 1 statement*
 
 #### -- filename:
-*"-- filename:"*  specifies the filename to be used when saving to the filesystem.
+*"-- filename:"*  specifies the filename to be used when saving to the filesystem.  
 
 #### -- messagename:
-*"-- messagename:"* TODO 
+*"-- messagename:"* when annotated above CREATE TABLE statement it will change the name of the proto message.  When annotated above a query it's the messagename to append.
+
+#### -- replace:
+*"-- replace:"*  can be applied to a single field to replace its type and import path.  *can be annotated many times above 1 statement* 
+
+#### Full Example:
+```sql
+-- generate:
+-- package: foo.bar.baz.v1
+-- outdir: "./gen"
+-- skip: alias 
+-- skip: name
+-- filename: iam.proto
+-- messagename: IAMUsers 
+-- replace: name google/type/expr.proto google.type.Expr
+-- replace: alias google/type/wrapper.proto google.type.StringValue
+CREATE TABLE "public"."users" (
+  "uuid" uuid NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
+  "name" character varying NOT NULL,
+  "alias" character varying NULL
+);
+```
+
+
 
 #### Type Conversion Default
 | Postgres | Not Null Proto | Null Proto |

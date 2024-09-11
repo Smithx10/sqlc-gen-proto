@@ -36,6 +36,7 @@ type generateOpts struct {
 	OutputDirectory string
 	MessageName     string
 	EnumName        string
+	Skip            []string
 }
 
 const (
@@ -219,6 +220,7 @@ func getGenerateOpts(comments []string) (*generateOpts, error) {
 			"outdir",
 			"filename",
 			"messagename",
+			"skip",
 		} {
 			if !strings.HasPrefix(strings.TrimSpace(rest), cmdOption) {
 				continue
@@ -258,6 +260,14 @@ func getGenerateOpts(comments []string) (*generateOpts, error) {
 				}
 				msgName := part[2]
 				g.MessageName = msgName
+			case "skip":
+				if len(part) != 3 {
+					return nil, fmt.Errorf(
+						"-- skip: <skip>... takes exactly 1 argument",
+					)
+				}
+				skipField := part[2]
+				g.Skip = append(g.Skip, skipField)
 			case "replace":
 				if len(part) != 5 {
 					return nil, fmt.Errorf(
@@ -298,6 +308,7 @@ type protofiles map[string]*protofile
 type message struct {
 	name   string
 	fields map[string]*field
+	skip   map[string]bool
 }
 
 type enum struct {
@@ -488,20 +499,26 @@ func (g *generator) handleMsg(opts *generateOpts, columns []*plugin.Column, pf *
 	opts.MessageName = protoName(opts.MessageName)
 
 	if g.protofiles[opts.Package].messages[opts.MessageName] == nil {
-		// Build Messsages
 		msg := &message{
 			name:   opts.MessageName,
 			fields: make(map[string]*field),
+			skip:   make(map[string]bool),
 		}
 		g.protofiles[opts.Package].messages[opts.MessageName] = msg
 	}
 
+	for _, s := range opts.Skip {
+		g.protofiles[opts.Package].messages[opts.MessageName].skip[s] = true
+	}
+
 	for _, c := range columns {
+		if g.protofiles[opts.Package].messages[opts.MessageName].skip[c.Name] {
+			continue
+		}
 		f := field{}
 		f.PrimaryKey = c.PrimaryKey
 		f.IsArray = c.IsArray
 		f.Name = fieldName(c.Name)
-		// protoType := pf.pgTypeToProtoType(c)
 		f.Type = g.handleImports(c, opts, pf)
 
 		// Build Field
@@ -514,7 +531,6 @@ func (g *generator) handleMsg(opts *generateOpts, columns []*plugin.Column, pf *
 func (g *generator) handleEnum(opts *generateOpts, e *plugin.Enum) {
 	opts.EnumName = protoName(opts.EnumName)
 	if g.protofiles[opts.Package].enums[opts.EnumName] == nil {
-		// Build Messsages
 		en := &enum{
 			name:   opts.EnumName,
 			values: enumName(opts.EnumName, e.Vals),
