@@ -1,0 +1,4 @@
+message {{ .Name }} { {{ range $i, $c := .Fields }}
+  {{ if $c.IsArray }}repeated {{end}}{{$c.Type}} {{$c.Name}} = {{$i}};
+{{end}}}
+

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 	"text/template"
 
@@ -12,11 +13,13 @@ import (
 	"github.com/sqlc-dev/sqlc/internal/codegen/sdk"
 	"github.com/sqlc-dev/sqlc/internal/plugin"
 
-	// "github.com/ryboe/q"
+	"embed"
 
-	// "google.golang.org/protobuf/compiler/protogen"
 	"google.golang.org/protobuf/proto"
 )
+
+//go:embed templates/*
+var templates embed.FS
 
 func main() {
 	if err := run(); err != nil {
@@ -31,6 +34,8 @@ type generateOpts struct {
 	Replace         map[string]protoType
 	FileName        string
 	OutputDirectory string
+	MessageName     string
+	EnumName        string
 }
 
 const (
@@ -40,9 +45,15 @@ const (
 )
 
 const (
-	msgTmplCode    = "message.tmpl"
-	headerTmplCode = "header.tmpl"
-	wkprefix       = "google.protobuf."
+	templateDir    = "templates/"
+	headerTmplName = "header.tmpl"
+	headerTmplCode = templateDir + headerTmplName
+	msgTmplName    = "message.tmpl"
+	msgTmplCode    = templateDir + msgTmplName
+	enumTmplName   = "enum.tmpl"
+	enumTmplCode   = templateDir + enumTmplName
+
+	wkprefix = "google.protobuf."
 
 	// proto represents builtin types
 	protoDouble   = "double"
@@ -65,6 +76,7 @@ const (
 	WellKnownAny              = wkprefix + "Any"
 	WellKnownBoolValue        = wkprefix + "BoolValue"
 	WellKnownBytesValue       = wkprefix + "BytesValue"
+	WellKnownDecimal          = wkprefix + "Decimal"
 	WellKnownDoubleValue      = wkprefix + "DoubleValue"
 	WellKnownDuration         = wkprefix + "Duration"
 	WellKnownEmpty            = wkprefix + "Empty"
@@ -80,6 +92,7 @@ const (
 	WellKnownListValue        = wkprefix + "ListValue"
 	WellKnownMethod           = wkprefix + "Method"
 	WellKnownMixin            = wkprefix + "Mixin"
+	WellKnownMoney            = wkprefix + "Money"
 	WellKnownNullValue        = wkprefix + "NullValue"
 	WellKnownOption           = wkprefix + "Option"
 	WellKnownSourceContext    = wkprefix + "SourceContext"
@@ -91,12 +104,12 @@ const (
 	WellKnownUInt32Value      = wkprefix + "UInt32Value"
 	WellKnownUInt64Value      = wkprefix + "UInt64Value"
 	WellKnownValue            = wkprefix + "Value"
-	WellKnownMoney            = wkprefix + "Money"
 
 	// imports
 	ImportGoogleProtobuf              = "google/protobuf/"
-	ImportGoogleProtobufAny           = ImportGoogleProtobuf + "any"
 	ImportGoogleProtobufAPI           = ImportGoogleProtobuf + "api"
+	ImportGoogleProtobufAny           = ImportGoogleProtobuf + "any"
+	ImportGoogleProtobufDecimal       = ImportGoogleProtobuf + "decimal"
 	ImportGoogleProtobufDuration      = ImportGoogleProtobuf + "duration"
 	ImportGoogleProtobufEmpty         = ImportGoogleProtobuf + "empty"
 	ImportGoogleProtobufEnum          = ImportGoogleProtobuf + "type"
@@ -117,6 +130,7 @@ var (
 		WellKnownAny:              ImportGoogleProtobufAny,
 		WellKnownBoolValue:        ImportGoogleProtobufWrappers,
 		WellKnownBytesValue:       ImportGoogleProtobufWrappers,
+		WellKnownDecimal:          ImportGoogleProtobufDecimal,
 		WellKnownDoubleValue:      ImportGoogleProtobufWrappers,
 		WellKnownDuration:         ImportGoogleProtobufDuration,
 		WellKnownEmpty:            ImportGoogleProtobufEmpty,
@@ -146,10 +160,14 @@ var (
 		WellKnownMoney:            ImportGoogleProtobufMoney,
 	}
 
-	headerTmpl = template.Must(template.New(headerTmplCode).
-			ParseFiles(headerTmplCode))
-	msgTmpl = template.Must(template.New(msgTmplCode).
-		ParseFiles(msgTmplCode))
+	// headerTmpl = template.Must(template.New(headerTmplCode).
+	// ParseFiles(headerTmplCode))
+	headerTmpl = template.Must(template.New("header.tmpl").
+			ParseFS(templates, headerTmplCode))
+	msgTmpl = template.Must(template.New("message.tmpl").
+		ParseFS(templates, msgTmplCode))
+	enumTmpl = template.Must(template.New("enum.tmpl").
+			ParseFS(templates, enumTmplCode))
 )
 
 type protoType struct {
@@ -158,13 +176,9 @@ type protoType struct {
 }
 
 func getGenerateOpts(comments []string) (*generateOpts, error) {
-	// params := make(map[string]string)
-	// flags := make(map[string]bool)
-	// var cleanedComments []string
 	replace := make(map[string]protoType)
 	g := &generateOpts{
-		Generate: true,
-		Replace:  replace,
+		Replace: replace,
 	}
 
 	for _, line := range comments {
@@ -196,14 +210,15 @@ func getGenerateOpts(comments []string) (*generateOpts, error) {
 			if !strings.HasPrefix(rest, opt) {
 				return nil, fmt.Errorf("invalid metadata: %s", line)
 			}
+			g.Generate = true
 		}
-		g.Generate = true
 
 		for _, cmdOption := range []string{
 			"package",
 			"replace",
 			"outdir",
 			"filename",
+			"messagename",
 		} {
 			if !strings.HasPrefix(strings.TrimSpace(rest), cmdOption) {
 				continue
@@ -235,6 +250,14 @@ func getGenerateOpts(comments []string) (*generateOpts, error) {
 				}
 				fileName := part[2]
 				g.FileName = fileName
+			case "messagename":
+				if len(part) != 3 {
+					return nil, fmt.Errorf(
+						"-- messagename: <messagename>... takes exactly 1 argument",
+					)
+				}
+				msgName := part[2]
+				g.MessageName = msgName
 			case "replace":
 				if len(part) != 5 {
 					return nil, fmt.Errorf(
@@ -255,91 +278,352 @@ func getGenerateOpts(comments []string) (*generateOpts, error) {
 	return g, nil
 }
 
-type HeaderInput struct {
+type headerInput struct {
 	PackageName string
 	Imports     map[string]string
 }
 
+type msgInput struct {
+	Name   string
+	Fields fields
+}
+
+type enumInput struct {
+	Name   string
+	Values []string
+}
+
+type protofiles map[string]*protofile
+
+type message struct {
+	name   string
+	fields map[string]*field
+}
+
+type enum struct {
+	name   string
+	values []string
+}
+
 type protofile struct {
-	header          *bytes.Buffer
-	msgs            *bytes.Buffer
+	headerBuf       *bytes.Buffer
+	msgsBuf         *bytes.Buffer
+	enumsBuf        *bytes.Buffer
+	messages        map[string]*message
+	enums           map[string]*enum
 	folderPath      string
 	packagename     string
 	filename        string
 	requiredImports map[string]string
+	fullpath        string
 }
 
 func pkgToPath(s string) string {
 	return strings.ReplaceAll(s, ".", "/")
 }
 
-func run() error {
-	protofiles := make(map[string]protofile)
-	var req plugin.GenerateRequest
+// func addToMsgProtoFiles(comments []string, columns *)
+func (g *generator) appendProtos(
+	input interface{},
+) error {
+	switch v := input.(type) {
+	case *plugin.Table:
+		o, err := getGenerateOpts(v.RawComments)
+		if !o.Generate {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if o.MessageName == "" {
+			o.MessageName = protoName(v.Rel.Name)
+		}
+		opts, err := setOptDefaults(o, false, "message.proto")
+		if err != nil {
+			return err
+		}
+		err = g.assembleProto(opts, v.Columns, nil)
+		if err != nil {
+			return err
+		}
+	case *plugin.Query:
+		o, err := getGenerateOpts(v.RawComments)
+		if !o.Generate {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		opts, err := setOptDefaults(o, true, "messsage.proto")
+		if err != nil {
+			return err
+		}
+		err = g.assembleProto(opts, v.Columns, nil)
+		if err != nil {
+			return err
+		}
+	case *plugin.Enum:
+		o, err := getGenerateOpts(v.RawComments)
+		if !o.Generate {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if o.EnumName == "" {
+			o.EnumName = protoName(v.Name)
+		}
+		opts, err := setOptDefaults(o, false, "enum.proto")
+		if err != nil {
+			return err
+		}
+		err = g.assembleProto(opts, nil, v)
+		if err != nil {
+			return err
+		}
+	}
 
+	return nil
+}
+
+func (g *generator) assembleProto(
+	opts *generateOpts,
+	columns []*plugin.Column,
+	e *plugin.Enum,
+) error {
+	if !opts.Generate {
+		return nil
+	}
+	pf := g.buildProtoFile(opts)
+	if e != nil {
+		g.handleEnum(opts, e)
+	}
+	if len(columns) > 0 {
+		g.handleMsg(opts, columns, pf)
+	}
+
+	return nil
+}
+
+func setOptDefaults(
+	opts *generateOpts,
+	query bool,
+	filename string,
+) (*generateOpts, error) {
+	// Handle Empty Options with Defaults
+	if opts.Package == "" {
+		opts.Package = "sqlcgen"
+	}
+	if opts.OutputDirectory == "" {
+		opts.OutputDirectory = "sqlcgen"
+	}
+	if opts.FileName == "" {
+		opts.FileName = filename
+	}
+	if query && opts.MessageName == "" {
+		return nil, fmt.Errorf(
+			"Queries that want to generate protobufs must declare a messagename: <messagename>",
+		)
+	}
+
+	return opts, nil
+}
+
+func (g *generator) buildProtoFile(opts *generateOpts) *protofile {
+	// Build File
+	header := bytes.Buffer{}
+	msgs := bytes.Buffer{}
+	enums := bytes.Buffer{}
+	folderpath := opts.OutputDirectory + "/" + pkgToPath(opts.Package)
+	pf := &protofile{
+		headerBuf:       &header,
+		msgsBuf:         &msgs,
+		enumsBuf:        &enums,
+		folderPath:      folderpath,
+		packagename:     opts.Package,
+		filename:        opts.FileName,
+		fullpath:        folderpath + "/" + opts.FileName,
+		requiredImports: make(map[string]string),
+		messages:        make(map[string]*message),
+		enums:           make(map[string]*enum),
+	}
+
+	if g.protofiles[opts.Package] == nil {
+		g.protofiles[opts.Package] = pf
+	}
+
+	return pf
+}
+
+func (g *generator) handleImports(c *plugin.Column, opts *generateOpts, pf *protofile) string {
+	replace, ok := opts.Replace[c.Name]
+	if ok {
+		if requiredImport(replace.Name) {
+			pf.requiredImports[replace.Name] = replace.ImportPath
+		}
+		return replace.Name
+	}
+
+	// If we don't find a type it may be because its an enum
+	ptype := pgTypeToProtoType(c)
+	if ptype == "unknown" {
+		pn := protoName(c.Type.Name)
+		for name, pro := range g.protofiles {
+			if g.protofiles[name].enums[pn] != nil {
+				ptype = name + "." + pn
+				pf.requiredImports[ptype] = pkgToPath(name) + "/" + pro.filename
+			}
+		}
+		return ptype
+	}
+
+	if requiredImport(ptype) {
+		pf.requiredImports[ptype] = protoTypeMap[ptype]
+	}
+
+	return ptype
+}
+
+func (g *generator) handleMsg(opts *generateOpts, columns []*plugin.Column, pf *protofile) {
+	opts.MessageName = protoName(opts.MessageName)
+
+	if g.protofiles[opts.Package].messages[opts.MessageName] == nil {
+		// Build Messsages
+		msg := &message{
+			name:   opts.MessageName,
+			fields: make(map[string]*field),
+		}
+		g.protofiles[opts.Package].messages[opts.MessageName] = msg
+	}
+
+	for _, c := range columns {
+		f := field{}
+		f.PrimaryKey = c.PrimaryKey
+		f.IsArray = c.IsArray
+		f.Name = fieldName(c.Name)
+		// protoType := pf.pgTypeToProtoType(c)
+		f.Type = g.handleImports(c, opts, pf)
+
+		// Build Field
+		if g.protofiles[opts.Package].messages[opts.MessageName].fields[f.Name] == nil {
+			g.protofiles[opts.Package].messages[opts.MessageName].fields[f.Name] = &f
+		}
+	}
+}
+
+func (g *generator) handleEnum(opts *generateOpts, e *plugin.Enum) {
+	opts.EnumName = protoName(opts.EnumName)
+	if g.protofiles[opts.Package].enums[opts.EnumName] == nil {
+		// Build Messsages
+		en := &enum{
+			name:   opts.EnumName,
+			values: enumName(opts.EnumName, e.Vals),
+		}
+		g.protofiles[opts.Package].enums[opts.EnumName] = en
+	}
+
+}
+
+func enumName(n string, s []string) []string {
+	u := strcase.ToSNAKE(n)
+	x := []string{u + "_UNSPECIFIED"}
+	for _, z := range s {
+		y := strcase.ToSNAKE(z)
+		x = append(x, (u + "_" + y))
+	}
+	return x
+}
+
+type generator struct {
+	protofiles map[string]*protofile
+}
+
+func run() error {
+	var req plugin.GenerateRequest
 	reqBlob, err := io.ReadAll(os.Stdin)
 	if err != nil {
 		return err
 	}
-
 	if err := proto.Unmarshal(reqBlob, &req); err != nil {
 		return err
 	}
 
+	protofiles := make(map[string]*protofile)
+	g := &generator{
+		protofiles: protofiles,
+	}
+
+	// Schema must be first because we only append columns to the map[string]*field
+	// queries that don't already exist.  Fields on *plugin.Column aren't
+	// parsed in queries.
 	schemas := req.Catalog.GetSchemas()
 	for _, s := range schemas {
 		if s.Name == "pg_catalog" || s.Name == "information_schema" {
 			continue
 		}
 
+		// Enums must go first,  because schema tables will match against
+		// those types
+		enums := s.GetEnums()
+		for _, e := range enums {
+			if err := g.appendProtos(e); err != nil {
+				return err
+			}
+		}
+
 		tables := s.GetTables()
 		for _, t := range tables {
-			opts, err := getGenerateOpts(t.RawComments)
-			if err != nil {
+			if err := g.appendProtos(t); err != nil {
 				return err
 			}
-			if !opts.Generate {
-				continue
-			}
-			if opts.Package == "" {
-				opts.Package = "sqlcgen"
-			}
-
-			if opts.FileName == "" {
-				opts.FileName = "message.proto"
-			}
-			if opts.OutputDirectory == "" {
-				opts.OutputDirectory = "sqlcgen"
-			}
-
-			msgs := bytes.Buffer{}
-			header := bytes.Buffer{}
-			file := protofile{
-				folderPath:      opts.OutputDirectory + "/" + pkgToPath(opts.Package),
-				packagename:     opts.Package,
-				filename:        opts.FileName,
-				msgs:            &msgs,
-				header:          &header,
-				requiredImports: make(map[string]string),
-			}
-
-			msgInput := file.toMsgInput(t, opts)
-			if err := msgTmpl.Execute(&msgs, msgInput); err != nil {
-				return err
-			}
-
-			protofiles[opts.Package] = file
 		}
+
+	}
+
+	// Queries can be added to the .proto,  Column data like "primarykey"
+	queries := req.GetQueries()
+	for _, query := range queries {
+		if err := g.appendProtos(query); err != nil {
+			return err
+		}
+
 	}
 
 	for pkg, output := range protofiles {
-		header := output.header
-		msgs := output.msgs
-		if err := headerTmpl.Execute(header, &HeaderInput{
+		header := output.headerBuf
+		msgs := output.msgsBuf
+		enums := output.enumsBuf
+
+		if err := headerTmpl.Execute(header, &headerInput{
 			PackageName: pkg,
 			Imports:     output.requiredImports,
 		}); err != nil {
 			return err
+		}
+
+		for name, message := range output.messages {
+			// Need maps to be determinsitic
+			sortedFields := make(fields, 0, len(message.fields))
+			for _, f := range message.fields {
+				sortedFields = append(sortedFields, *f)
+			}
+			sort.Sort(sortedFields)
+
+			if err := msgTmpl.Execute(msgs, &msgInput{
+				Name:   name,
+				Fields: sortedFields,
+			}); err != nil {
+				return err
+			}
+		}
+
+		for name, e := range output.enums {
+			if err := enumTmpl.Execute(enums, &enumInput{
+				Name:   name,
+				Values: e.values,
+			}); err != nil {
+				return err
+			}
 		}
 
 		if _, err := os.Stat(output.folderPath); err != nil {
@@ -361,9 +645,19 @@ func run() error {
 		}
 
 		// Append Messages to .protofile
-		_, err = f.Write(msgs.Bytes())
-		if err != nil {
-			return err
+		if len(output.messages) > 0 {
+			_, err = f.Write(msgs.Bytes())
+			if err != nil {
+				return err
+			}
+		}
+
+		// Append Messages to .protofile
+		if len(output.enums) > 0 {
+			_, err = f.Write(enums.Bytes())
+			if err != nil {
+				return err
+			}
 		}
 
 		if err := f.Close(); err != nil {
@@ -374,15 +668,33 @@ func run() error {
 	return nil
 }
 
-type msgInput struct {
-	Name   string
-	Fields []Field
+type field struct {
+	Name       string
+	Type       string
+	IsArray    bool
+	PrimaryKey bool
 }
 
-type Field struct {
-	Name    string
-	Type    string
-	IsArray bool
+type fields []field
+
+func (f fields) Len() int {
+	return len(f)
+}
+
+func (f fields) Swap(i, j int) {
+	f[i], f[j] = f[j], f[i]
+}
+
+func (f fields) Less(i, j int) bool {
+	// Always put "primarykey" first
+	if f[i].PrimaryKey {
+		return true
+	}
+	if f[j].PrimaryKey {
+		return false
+	}
+	// Otherwise, sort alphabetically by Name
+	return f[i].Name < f[j].Name
 }
 
 func protoName(s string) string {
@@ -396,34 +708,6 @@ func fieldName(s string) string {
 	s = strings.ToLower(s)
 	s = strcase.ToSnake(s)
 	return s
-}
-
-func (g *protofile) toMsgInput(tbl *plugin.Table, genOpts *generateOpts) msgInput {
-	m := msgInput{Name: protoName(tbl.Rel.Name)}
-	for _, c := range tbl.Columns {
-		f := Field{}
-
-		f.IsArray = c.IsArray
-		f.Name = fieldName(c.Name)
-		protoType := g.pgTypeToProtoType(c)
-
-		replace, ok := genOpts.Replace[f.Name]
-		if ok {
-			if requiredImport(replace.Name) {
-				g.requiredImports[replace.Name] = replace.ImportPath
-			}
-			protoType = replace.Name
-		} else {
-			if requiredImport(protoType) {
-				g.requiredImports[protoType] = protoTypeMap[protoType]
-			}
-		}
-		f.Type = protoType
-
-		m.Fields = append(m.Fields, f)
-	}
-
-	return m
 }
 
 func requiredImport(s string) bool {
@@ -463,7 +747,8 @@ func requiredImport(s string) bool {
 	return true
 }
 
-func (g *protofile) pgTypeToProtoType(col *plugin.Column) string {
+// Type, NotFound
+func pgTypeToProtoType(col *plugin.Column) string {
 	columnType := sdk.DataType(col.Type)
 	notNull := col.NotNull || col.IsArray
 	// driver := parseDriver(options./*  */SqlPackage)
@@ -514,7 +799,10 @@ func (g *protofile) pgTypeToProtoType(col *plugin.Column) string {
 		}
 		return WellKnownFloatValue
 
-	case "numeric", "pg_catalog.numeric", "money":
+	case "numeric", "pg_catalog.numeric":
+		return WellKnownDecimal
+
+	case "money":
 		return WellKnownMoney
 
 	case "boolean", "bool", "pg_catalog.bool":
@@ -526,13 +814,7 @@ func (g *protofile) pgTypeToProtoType(col *plugin.Column) string {
 	case "json":
 		return WellKnownStruct
 
-	case "jsonb":
-		if notNull {
-			return protoBytes
-		}
-		return WellKnownBytesValue
-
-	case "bytea", "blob", "pg_catalog.bytea":
+	case "uuid", "jsonb", "bytea", "blob", "pg_catalog.bytea":
 		if notNull {
 			return protoBytes
 		}
@@ -563,12 +845,6 @@ func (g *protofile) pgTypeToProtoType(col *plugin.Column) string {
 			return protoString
 		}
 		return WellKnownStringValue
-
-	case "uuid":
-		if notNull {
-			return protoBytes
-		}
-		return WellKnownBytesValue
 
 	// All these PG Range Types Required FieldOptions
 	// Handle this Later
@@ -776,8 +1052,8 @@ func (g *protofile) pgTypeToProtoType(col *plugin.Column) string {
 		return WellKnownAny
 
 	default:
-		return WellKnownAny
+		return "unknown"
 	}
 
-	return WellKnownAny
+	return "unknown"
 }
