@@ -78,8 +78,8 @@ This takes care of keeping the messages in the database and the messages deliver
 | double precision | Float | FloatValue |
 | float8 | Float | FloatValue |
 | pg_catalog.float8 | Float | FloatValue |
-| numeric" | DecimalValue | DecimalValue |
-| pg_catalog.numeric" | DecimalValue | DecimalValue |
+| numeric" | Decimal | Decimal |
+| pg_catalog.numeric" | Decimal | Decimal |
 | money | Money | Money |
 | boolean | bool | BoolValue |
 | bool | bool | BoolValue |
