@@ -11,6 +11,7 @@ When developing middleware that calls into generated code from sqlc we ended up 
 4. Repeat endlessly.
 
 Client -> req: with sqlc-gen-proto messages -> Service -> sqlc-gen-go functions () -> Database
+
 Database -> sqlc-gen-go type -> Service -> resp: with sqlc-gen-proto messages -> Client
 
 This takes care of keeping the messages in the database and the messages delivered to your clients in sync.  Request and Response are manually created because you may need additional context that applies only to your middleware.
