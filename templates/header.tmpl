@@ -1,6 +1,0 @@
-syntax = "proto3";
-
-package {{ .PackageName }};
-
-{{ range $i, $e := .Imports }}import "{{$e}}";
-{{end}}
