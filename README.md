@@ -1,6 +1,9 @@
 # sqlc-gen-proto Generates .proto files
 
 
+## Requires a forked sqlc at the moment.
+
+
 ## Usage
 #### Problem:
 When developing middleware that calls into generated code from sqlc we ended up doing a lot of copy and paste.  This is an attempt to create the following iteration workflow.
@@ -10,11 +13,6 @@ When developing middleware that calls into generated code from sqlc we ended up 
 3. Create Proto Request_Response and Proto Services using Messages generated from this plugin.
 4. Repeat endlessly.
 
-Client -> req: with sqlc-gen-proto messages -> Service -> sqlc-gen-go functions () -> Database
-
-Database -> sqlc-gen-go type -> Service -> resp: with sqlc-gen-proto messages -> Client
-
-This takes care of keeping the messages in the database and the messages delivered to your clients in sync.  Request and Response are manually created because you may need additional context that applies only to your middleware.
 
 
 ### Current Comment Annotation Options:
@@ -22,9 +20,6 @@ This takes care of keeping the messages in the database and the messages deliver
 | Name | Default Value |
 | -------------- | --------------- |
 | "package" | "sqlcgen" |
-| "outdir" | "./sqlcgen'"|
-|"filename" for enums | "enum.proto" |
-|"filename" for messages | "message.proto" |
 | "messagename" | tablename |
 
 
@@ -34,32 +29,52 @@ This takes care of keeping the messages in the database and the messages deliver
 #### -- package:
 *"-- package:"*  specifies the package for the given protobuf file.
 
-#### -- outdir:
-*"-- outdir:"*  specifies the base directory where the package hierarchy will be created.
-
 #### -- skip:
 *"-- skip:"*  can be applied to a single field to indicate you'd like to not include it in the message.  By default all columns in both queries and tables are added. *can be annotated many times above 1 statement*
 
-#### -- filename:
-*"-- filename:"*  specifies the filename to be used when saving to the filesystem.  
+#### SQL Plugin Config
+```json
+{
+  "version": "2",
+  "plugins": [
+    {
+      "name": "proto",
+      "process": {
+        "cmd": "sqlc-gen-proto"
+      }
+    }
+  ],
+  "sql": [
+    {
+      "engine": "postgresql",
+      "queries": "query.sql",
+      "schema": "schema.sql",
+      "codegen": [
+        {
+          "out": "gen",
+          "plugin": "proto",
+          "options": {
+            "out_dir": "./gen",
+            "user_defined_dir": "./user_defined",
+            "one_of_id": "ident",
+            "default_package": "bob"
+          }
+        }
+      ]
+    }
+  ]
+}
+```
 
-#### -- messagename:
-*"-- messagename:"* when annotated above CREATE TABLE statement it will change the name of the proto message.  When annotated above a query it's the messagename to append.
 
-#### -- replace:
-*"-- replace:"*  can be applied to a single field to replace its type and import path.  *can be annotated many times above 1 statement* 
+
 
 #### Full Example:
 ```sql
 -- generate:
 -- package: foo.bar.baz.v1
--- outdir: "./gen"
 -- skip: alias 
 -- skip: name
--- filename: iam.proto
--- messagename: IAMUsers 
--- replace: name google/type/expr.proto google.type.Expr
--- replace: alias google/type/wrapper.proto google.type.StringValue
 CREATE TABLE "public"."users" (
   "uuid" uuid NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
   "name" character varying NOT NULL,
@@ -119,8 +134,6 @@ CREATE TABLE "public"."users" (
 | pg_catalog.timetz | Timestamp | Timestamp |
 | pg_catalog.time | Timestamp | Timestamp |
 | void | Any | Any |
-
-
 
 Schema:
 ```sql
@@ -324,3 +337,59 @@ enum ResourceType {
 
 
 
+#### Extending Messages, Enums, Request_Response and Services:
+Messages defined in the user_defined directory that match the generate file path will be merged or appended.
+
+For Example:
+``` sql
+-- generate:
+-- package: baz.bar.foo.v1
+CREATE TABLE "public"."users" (
+  "uuid" uuid NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
+  "name" character varying NOT NULL,
+  "alias" character varying NULL,
+  "description" character varying NULL,
+  "created_at" timestamptz NOT NULL DEFAULT NOW(),
+  "updated_at" timestamptz NOT NULL DEFAULT NOW(),
+  "deleted_at" timestamptz
+);
+```
+With the following manually defined...
+user_defined/baz/bar/foo/v1/message.proto
+``` proto
+syntax = "proto3";
+
+package baz.bar.foo.v1;
+
+
+message Users {
+  string test_field = 1;
+}
+
+message Groups {
+  google.protobuf.StringValue test_field = 1;
+}
+```
+
+Will result in this message in generated proto
+```proto
+message Users {
+  bytes uuid = 1;
+
+  string name = 2;
+
+  google.protobuf.StringValue alias = 3;
+
+  google.protobuf.StringValue description = 4;
+
+  google.protobuf.Timestamp created_at = 5;
+
+  google.protobuf.Timestamp updated_at = 6;
+
+  google.protobuf.Timestamp deleted_at = 7;
+
+  repeated string memberof = 8;
+
+  string test_field = 9;
+}
+```

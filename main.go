@@ -1,185 +1,975 @@
 package main
 
 import (
-	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
+	"log"
+	"net/url"
 	"os"
+	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
-	"text/template"
 
 	"github.com/ettle/strcase"
 	"github.com/sqlc-dev/sqlc/internal/codegen/sdk"
 	"github.com/sqlc-dev/sqlc/internal/plugin"
-
-	"embed"
-
 	"google.golang.org/protobuf/proto"
-)
 
-//go:embed templates/*
-var templates embed.FS
+	"github.com/bufbuild/protocompile/parser"
+	"github.com/bufbuild/protocompile/reporter"
+	"github.com/jhump/protoreflect/v2/protobuilder"
+	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/structpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 
-func main() {
-	if err := run(); err != nil {
-		fmt.Fprintf(os.Stderr, "error generating JSON: %s", err)
-		os.Exit(2)
-	}
-}
+	// "github.com/ryboe/q"
+	// "google.golang.org/genproto/googleapis/type/expr"
+	"google.golang.org/genproto/googleapis/api/annotations"
+	"google.golang.org/genproto/googleapis/type/decimal"
+	"google.golang.org/genproto/googleapis/type/money"
 
-type generateOpts struct {
-	Generate        bool
-	Package         string
-	Replace         map[string]protoType
-	FileName        string
-	OutputDirectory string
-	MessageName     string
-	EnumName        string
-	Skip            []string
-}
+	"github.com/jhump/protoreflect/v2/protoprint"
 
-const (
-	OptGenerate = ":generate"
-	OptPackage  = ":package"
-	OptReplace  = ":replace"
-)
-
-const (
-	templateDir    = "templates/"
-	headerTmplName = "header.tmpl"
-	headerTmplCode = templateDir + headerTmplName
-	msgTmplName    = "message.tmpl"
-	msgTmplCode    = templateDir + msgTmplName
-	enumTmplName   = "enum.tmpl"
-	enumTmplCode   = templateDir + enumTmplName
-
-	wkprefix = "google.protobuf."
-
-	// proto represents builtin types
-	protoDouble   = "double"
-	protoFloat    = "float"
-	protoInt32    = "int32"
-	protoInt64    = "int64"
-	protoUint32   = "uint32"
-	protoUint64   = "uint64"
-	protoSint32   = "sint32"
-	protoSint64   = "sint64"
-	protoFixed32  = "fixed32"
-	protoFixed64  = "fixed64"
-	protoSFixed32 = "sfixed32"
-	protoSFixed64 = "sfixed64"
-	protoBool     = "bool"
-	protoString   = "string"
-	protoBytes    = "bytes"
-
-	// well known represents google.proto. well known types
-	WellKnownAny              = wkprefix + "Any"
-	WellKnownBoolValue        = wkprefix + "BoolValue"
-	WellKnownBytesValue       = wkprefix + "BytesValue"
-	WellKnownDecimal          = wkprefix + "Decimal"
-	WellKnownDoubleValue      = wkprefix + "DoubleValue"
-	WellKnownDuration         = wkprefix + "Duration"
-	WellKnownEmpty            = wkprefix + "Empty"
-	WellKnownEnum             = wkprefix + "Enum"
-	WellKnownEnumValue        = wkprefix + "EnumValue"
-	WellKnownField            = wkprefix + "Field"
-	WellKnownFieldCardinality = wkprefix + "Field.Cardinality"
-	WellKnownFieldKind        = wkprefix + "Field.Kind"
-	WellKnownFieldMask        = wkprefix + "FieldMask"
-	WellKnownFloatValue       = wkprefix + "FloatValue"
-	WellKnownInt32Value       = wkprefix + "Int32Value"
-	WellKnownInt64Value       = wkprefix + "Int64Value"
-	WellKnownListValue        = wkprefix + "ListValue"
-	WellKnownMethod           = wkprefix + "Method"
-	WellKnownMixin            = wkprefix + "Mixin"
-	WellKnownMoney            = wkprefix + "Money"
-	WellKnownNullValue        = wkprefix + "NullValue"
-	WellKnownOption           = wkprefix + "Option"
-	WellKnownSourceContext    = wkprefix + "SourceContext"
-	WellKnownStringValue      = wkprefix + "StringValue"
-	WellKnownStruct           = wkprefix + "Struct"
-	WellKnownSyntax           = wkprefix + "Syntax"
-	WellKnownTimestamp        = wkprefix + "Timestamp"
-	WellKnownType             = wkprefix + "Type"
-	WellKnownUInt32Value      = wkprefix + "UInt32Value"
-	WellKnownUInt64Value      = wkprefix + "UInt64Value"
-	WellKnownValue            = wkprefix + "Value"
-
-	// imports
-	ImportGoogleProtobuf              = "google/protobuf/"
-	ImportGoogleProtobufAPI           = ImportGoogleProtobuf + "api"
-	ImportGoogleProtobufAny           = ImportGoogleProtobuf + "any"
-	ImportGoogleProtobufDecimal       = ImportGoogleProtobuf + "decimal"
-	ImportGoogleProtobufDuration      = ImportGoogleProtobuf + "duration"
-	ImportGoogleProtobufEmpty         = ImportGoogleProtobuf + "empty"
-	ImportGoogleProtobufEnum          = ImportGoogleProtobuf + "type"
-	ImportGoogleProtobufEnumValue     = ImportGoogleProtobuf + "type"
-	ImportGoogleProtobufFieldMask     = ImportGoogleProtobuf + "field_mask"
-	ImportGoogleProtobufListValue     = ImportGoogleProtobuf + "struct"
-	ImportGoogleProtobufMoney         = ImportGoogleProtobuf + "money"
-	ImportGoogleProtobufSourceContext = ImportGoogleProtobuf + "source_context"
-	ImportGoogleProtobufStruct        = ImportGoogleProtobuf + "struct"
-	ImportGoogleProtobufTimestamp     = ImportGoogleProtobuf + "timestamp"
-	ImportGoogleProtobufType          = ImportGoogleProtobuf + "type"
-	ImportGoogleProtobufValue         = ImportGoogleProtobuf + "struct"
-	ImportGoogleProtobufWrappers      = ImportGoogleProtobuf + "wrappers"
+	"google.golang.org/protobuf/types/descriptorpb"
 )
 
 var (
-	protoTypeMap = map[string]string{
-		WellKnownAny:              ImportGoogleProtobufAny,
-		WellKnownBoolValue:        ImportGoogleProtobufWrappers,
-		WellKnownBytesValue:       ImportGoogleProtobufWrappers,
-		WellKnownDecimal:          ImportGoogleProtobufDecimal,
-		WellKnownDoubleValue:      ImportGoogleProtobufWrappers,
-		WellKnownDuration:         ImportGoogleProtobufDuration,
-		WellKnownEmpty:            ImportGoogleProtobufEmpty,
-		WellKnownEnum:             ImportGoogleProtobufEnum,
-		WellKnownEnumValue:        ImportGoogleProtobufEnumValue,
-		WellKnownField:            ImportGoogleProtobufType,
-		WellKnownFieldCardinality: ImportGoogleProtobufType,
-		WellKnownFieldKind:        ImportGoogleProtobufType,
-		WellKnownFieldMask:        ImportGoogleProtobufFieldMask,
-		WellKnownFloatValue:       ImportGoogleProtobufWrappers,
-		WellKnownInt32Value:       ImportGoogleProtobufWrappers,
-		WellKnownInt64Value:       ImportGoogleProtobufWrappers,
-		WellKnownListValue:        ImportGoogleProtobufStruct,
-		WellKnownMethod:           ImportGoogleProtobufAPI,
-		WellKnownMixin:            ImportGoogleProtobufAPI,
-		WellKnownNullValue:        ImportGoogleProtobufStruct,
-		WellKnownOption:           ImportGoogleProtobufType,
-		WellKnownSourceContext:    ImportGoogleProtobufSourceContext,
-		WellKnownStringValue:      ImportGoogleProtobufWrappers,
-		WellKnownStruct:           ImportGoogleProtobufStruct,
-		WellKnownSyntax:           ImportGoogleProtobufType,
-		WellKnownTimestamp:        ImportGoogleProtobufTimestamp,
-		WellKnownType:             ImportGoogleProtobufType,
-		WellKnownUInt32Value:      ImportGoogleProtobufWrappers,
-		WellKnownUInt64Value:      ImportGoogleProtobufWrappers,
-		WellKnownValue:            ImportGoogleProtobufStruct,
-		WellKnownMoney:            ImportGoogleProtobufMoney,
-	}
+	DEFAULT_OUTDIR           = "./sqlcgen"
+	DEFAULT_USER_DEFINED_DIR = "./user_defined"
+	DEFAULT_DEFAULT_PACKAGE  = "sqlcgen"
+	DEFAULT_ONE_OF_ID        = "identifier"
+	SYNTAX_PROTO3            = "proto3"
+	DO_NOT_GENERATE          = "DO_NOT_GENERATE"
 
-	// headerTmpl = template.Must(template.New(headerTmplCode).
-	// ParseFiles(headerTmplCode))
-	headerTmpl = template.Must(template.New("header.tmpl").
-			ParseFS(templates, headerTmplCode))
-	msgTmpl = template.Must(template.New("message.tmpl").
-		ParseFS(templates, msgTmplCode))
-	enumTmpl = template.Must(template.New("enum.tmpl").
-			ParseFS(templates, enumTmplCode))
+	METHOD_NAMES = []string{"Create", "Get", "Update", "Delete", "List"}
 )
 
-type protoType struct {
-	ImportPath string
-	Name       string
+type options struct {
+	OutDir         string `json:"out_dir,omitempty"          yaml:"out_dir"`
+	UserDefinedDir string `json:"user_defined_dir,omitempty" yaml:"user_defined_dir"`
+	OneOfID        string `json:"one_of_id,omitempty"        yaml:"one_of_id"`
+	DefaultPackage string `json:"default_package,omitempty"  yaml:"default_package"`
 }
 
-func getGenerateOpts(comments []string) (*generateOpts, error) {
-	replace := make(map[string]protoType)
-	g := &generateOpts{
-		Replace: replace,
+func getGenRequest() (*plugin.GenerateRequest, error) {
+	var req plugin.GenerateRequest
+	reqBlob, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return nil, err
+	}
+	if err := proto.Unmarshal(reqBlob, &req); err != nil {
+		return nil, err
+	}
+
+	return &req, nil
+}
+
+func parseOptions(req *plugin.GenerateRequest) (*options, error) {
+	var options *options
+	if len(req.PluginOptions) == 0 {
+		return options, nil
+	}
+	if err := json.Unmarshal(req.PluginOptions, &options); err != nil {
+		return nil, err
+	}
+	if options.OutDir == "" {
+		options.OutDir = DEFAULT_OUTDIR
+	}
+	if options.UserDefinedDir == "" {
+		options.UserDefinedDir = DEFAULT_USER_DEFINED_DIR
+	}
+	if options.OneOfID == "" {
+		options.OneOfID = DEFAULT_ONE_OF_ID
+	}
+	if options.DefaultPackage == "" {
+		options.DefaultPackage = DEFAULT_DEFAULT_PACKAGE
+	}
+
+	DEFAULT_OUTDIR = options.OutDir
+	DEFAULT_DEFAULT_PACKAGE = options.DefaultPackage
+	DEFAULT_ONE_OF_ID = options.OneOfID
+	DEFAULT_USER_DEFINED_DIR = options.UserDefinedDir
+
+	return options, nil
+}
+
+func main() {
+	fdm := make(map[fpath]*protobuilder.FileBuilder)
+	req, err := getGenRequest()
+	if err != nil {
+		log.Fatal(err)
+	}
+	opts, err := parseOptions(req)
+	if err != nil {
+		log.Fatal(err)
+	}
+	p := &Protos{
+		files:   fdm,
+		tables:  make([]*table, 0),
+		enums:   make([]*enum, 0),
+		queries: make([]*query, 0),
+		options: opts,
+	}
+
+	if err := p.run(req); err != nil {
+		log.Fatal(err)
+	}
+}
+
+// used to inform what kind of string to use in maps
+type fpath string
+type messagename string
+type methodname string
+
+type Protofiles []*protobuilder.FileBuilder
+
+// Sort order map
+var sortOrder = map[string]int{
+	"enum.proto":             1,
+	"message.proto":          2,
+	"request_response.proto": 3,
+	"service.proto":          4,
+}
+
+func (pf Protofiles) Len() int {
+	return len(pf)
+}
+
+func (pf Protofiles) Swap(i, j int) {
+	pf[i], pf[j] = pf[j], pf[i]
+
+}
+
+func (pf Protofiles) Less(i, j int) bool {
+	filenameI := filepath.Base(pf[i].Path())
+	filenameJ := filepath.Base(pf[j].Path())
+
+	orderI, okI := sortOrder[filenameI]
+	orderJ, okJ := sortOrder[filenameJ]
+	if okI && okJ {
+		return orderI < orderJ
+	}
+
+	if okI {
+		return true
+	}
+
+	if okJ {
+		return false
+	}
+
+	return filenameI < filenameJ
+}
+
+// map[ $outdir/$package/$filename]
+// map["./sqlcgen/foo/bar/baz/v1/message.proto"]
+type Protos struct {
+	queries []*query
+	tables  []*table
+	enums   []*enum
+	files   map[fpath]*protobuilder.FileBuilder
+	options *options
+}
+
+func handleSkip(s string, skips []string) bool {
+	for _, skip := range skips {
+		if s == skip {
+			return true
+		}
+	}
+	return false
+}
+
+func copyAnnotations(t *table) error {
+	if t.a.ReqResp != nil {
+		t.a.ReqResp.a = &Annotations{
+			Generate: t.a.Generate,
+			Package:  t.a.Package,
+			OutDir:   t.a.OutDir,
+		}
+		if err := setProps(t.a.ReqResp); err != nil {
+			return err
+		}
+	}
+	if t.a.Service != nil {
+		t.a.Service.a = &Annotations{
+			Generate: t.a.Generate,
+			Package:  t.a.Package,
+			OutDir:   t.a.OutDir,
+		}
+		if err := setProps(t.a.Service); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func toRequestName(method, msgName string) string {
+	return fmt.Sprintf("%s%s%s", method, msgName, "Request")
+
+}
+func toResponseName(method, msgName string) string {
+	return fmt.Sprintf("%s%s%s", method, msgName, "Response")
+}
+
+func toHttpRule(method string, t *table) *annotations.HttpRule {
+	var httpRule *annotations.HttpRule
+	identifier := t.a.PrimaryKey
+
+	// POST, LIST
+	p := t.a.Service.Path.Path
+	// GET, UPDATE, DELETE
+	gp := fmt.Sprintf("%s/{%s}", p, identifier)
+
+	switch method {
+	case "Create":
+		// Create are always POST with the path
+		// Ex: /v1/users -X POST
+		httpRule = &annotations.HttpRule{
+			Pattern: &annotations.HttpRule_Post{
+				Post: p,
+			},
+			Body: "*",
+		}
+	case "Get":
+		// Get are always GET with path + primarykey,
+		// OneOf must have oneof the primary key.
+		// Connect cann't use a oneofs value.
+		// Ex: /v1/users/{uuid}
+		httpRule = &annotations.HttpRule{
+			Pattern: &annotations.HttpRule_Get{
+				Get: gp,
+			},
+		}
+	case "Update":
+		// Update are always PUT with path + primarykey,
+		// OneOf must have oneof the primary key.
+		// Connect cann't use a oneofs value.
+		// Ex: /v1/users/{uuid}
+		httpRule = &annotations.HttpRule{
+			Pattern: &annotations.HttpRule_Put{
+				Put: gp,
+			},
+			Body: "*",
+		}
+	case "Delete":
+		// Delete are always DELETE with path + primarykey,
+		// OneOf must have oneof the primary key.
+		// Connect cann't use a oneofs value.
+		// Ex: /v1/users/{uuid}
+		httpRule = &annotations.HttpRule{
+			Pattern: &annotations.HttpRule_Delete{
+				Delete: gp,
+			},
+		}
+	case "List":
+		// List are always GET with path,
+		// OneOf must have oneof the primary key.
+		// Connect cann't use a oneofs value.
+		// Ex: /v1/users/{uuid}
+		httpRule = &annotations.HttpRule{
+			Pattern: &annotations.HttpRule_Get{
+				Get: p,
+			},
+		}
+	}
+
+	return httpRule
+}
+
+func (p Protos) createServices(
+	mName string,
+	rrMap map[methodname]*protobuilder.MessageBuilder,
+	t *table,
+) (err error) {
+	svcfb := p.getFD(t.a.Service.a)
+	sName := toPascal(t.a.Service.Name)
+	n := protoreflect.Name(*sName)
+
+	sb := svcfb.GetService(n)
+	if sb == nil {
+		sb = protobuilder.NewService(n)
+		defer func() {
+			if iErr := svcfb.TryAddService(sb); err != nil {
+				err = iErr
+			}
+		}()
+	}
+	for _, method := range METHOD_NAMES {
+		req := rrMap[methodname(toRequestName(method, mName))]
+		resp := rrMap[methodname(toResponseName(method, mName))]
+
+		reqRPC := protobuilder.RpcTypeMessage(req, false)
+		respRPC := protobuilder.RpcTypeMessage(resp, false)
+		methName := fmt.Sprintf("%s%s", method, mName)
+
+		mb := protobuilder.NewMethod(
+			protoreflect.Name(methName),
+			reqRPC,
+			respRPC,
+		)
+
+		httpRule := toHttpRule(method, t)
+
+		methodOptions := &descriptorpb.MethodOptions{}
+		proto.SetExtension(methodOptions, annotations.E_Http, httpRule)
+		mb.SetOptions(methodOptions)
+
+		// mtdOpts := (*descriptorpb.MethodOptions{}(nil).ProtoReflect().Descriptor())
+		// mb.Options.GetFeatures
+		// mb.SetOptions()
+
+		if err := sb.TryAddMethod(mb); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (p Protos) createRequestResponses(
+	messageb *protobuilder.MessageBuilder,
+	t *table,
+) (map[methodname]*protobuilder.MessageBuilder, error) {
+	mName := string(messageb.Name())
+	// Copy over Annotations Into New Pointer
+	// and Set Properties for ReqResp type.
+	// if err := copyAnnotations(t); err != nil {
+	// 	return nil, err
+	// }
+
+	// Get a new FileDescriptor
+	rrfb := p.getFD(t.a.ReqResp.a)
+
+	reqrespMap := make(map[methodname]*protobuilder.MessageBuilder)
+	for _, method := range METHOD_NAMES {
+		reqName := toRequestName(method, mName)
+		respName := toResponseName(method, mName)
+
+		reqb := protobuilder.NewMessage(protoreflect.Name(reqName))
+		respb := protobuilder.NewMessage(protoreflect.Name(respName))
+
+		// Add Annotedated Additional Fields
+		for aType, aField := range t.a.ReqResp.ReqFields {
+			at, err := p.convertType(aType)
+			if err != nil {
+				return nil, err
+			}
+			ab := protobuilder.NewField(
+				protoreflect.Name(aField),
+				at,
+			)
+			if err := reqb.TryAddField(ab); err != nil {
+				return nil, err
+			}
+
+		}
+
+		// Add OneOf
+		var oneof *protobuilder.OneofBuilder
+		if len(*t.a.ReqResp.OneOf) > 0 {
+			oneof = protobuilder.NewOneof(protoreflect.Name(p.options.OneOfID))
+		}
+		for _, ooField := range *t.a.ReqResp.OneOf {
+			ooName := protoreflect.Name(ooField)
+			oob := messageb.GetField(ooName)
+			if oob != nil {
+				fCopy := protobuilder.NewField(oob.Name(), oob.Type())
+				if err := oneof.TryAddChoice(fCopy); err != nil {
+					return nil, err
+				}
+			}
+		}
+
+		if method == "Get" || method == "Update" || method == "Delete" {
+			if err := reqb.TryAddOneOf(oneof); err != nil {
+				return nil, err
+			}
+		}
+
+		// only for Create, Update,
+		if method == "Create" || method == "Update" {
+			fb := protobuilder.NewField(
+				protoreflect.Name(*toLowerSnake(mName)),
+				protobuilder.FieldTypeMessage(messageb),
+			)
+			if err := reqb.TryAddField(fb); err != nil {
+				return nil, err
+			}
+		}
+
+		if method == "List" {
+			psb := protobuilder.NewField(
+				protoreflect.Name("page_size"),
+				protobuilder.FieldTypeInt32(),
+			)
+			if err := reqb.TryAddField(psb); err != nil {
+				return nil, err
+			}
+			ptb := protobuilder.NewField(
+				protoreflect.Name("page_token"),
+				protobuilder.FieldTypeString(),
+			)
+			if err := reqb.TryAddField(ptb); err != nil {
+				return nil, err
+			}
+		}
+
+		if err := rrfb.TryAddMessage(reqb); err != nil {
+			return nil, err
+		}
+
+		skip := false
+		for m, enabled := range t.a.ReqResp.RespEmpty {
+			if strings.ToLower(method) == strings.ToLower(m) && enabled {
+				skip = true
+				continue
+			}
+		}
+		if skip || method != "Delete" {
+			fb := protobuilder.NewField(
+				protoreflect.Name(*toLowerSnake(mName)),
+				protobuilder.FieldTypeMessage(messageb),
+			)
+			if method == "List" {
+				fb.SetRepeated()
+				npt := protobuilder.NewField(
+					protoreflect.Name("next_page_token"),
+					protobuilder.FieldTypeString(),
+				)
+				if err := respb.TryAddField(npt); err != nil {
+					return nil, err
+				}
+			}
+			if err := respb.TryAddField(fb); err != nil {
+				return nil, err
+			}
+		}
+
+		if err := rrfb.TryAddMessage(respb); err != nil {
+			return nil, err
+		}
+
+		reqrespMap[methodname(reqName)] = reqb
+		reqrespMap[methodname(respName)] = respb
+	}
+
+	return reqrespMap, nil
+}
+
+func (p Protos) tableToMessage(
+	fileb *protobuilder.FileBuilder,
+	t *table,
+) error {
+	mName := *toPascal(t.i.Rel.Name)
+	messageb := protobuilder.NewMessage(protoreflect.Name(mName))
+
+	for _, c := range t.i.Columns {
+		if handleSkip(c.Name, t.a.Skips) {
+			continue
+		}
+		if c.PrimaryKey {
+			t.a.PrimaryKey = c.Name
+		}
+		cName := protoreflect.Name(c.Name)
+		t, err := p.convertType(c)
+		if err != nil {
+			return err
+		}
+
+		fieldb := protobuilder.NewField(cName, t)
+		if c.IsArray {
+			fieldb.SetRepeated()
+		}
+
+		if err := messageb.TryAddField(fieldb); err != nil {
+			return err
+		}
+	}
+
+	if err := fileb.TryAddMessage(messageb); err != nil {
+		return err
+	}
+
+	// Copy over Annotations Into New Pointer
+	// and Set Properties for ReqResp type.
+	if err := copyAnnotations(t); err != nil {
+		return err
+	}
+	// Handle request_response
+	var rrMap map[methodname]*protobuilder.MessageBuilder
+	if t.a.ReqResp != nil {
+		rr, err := p.createRequestResponses(messageb, t)
+		if err != nil {
+			return err
+		}
+		rrMap = rr
+	}
+
+	// Handle service
+	if t.a.Service != nil {
+		if err := p.createServices(mName, rrMap, t); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (p Protos) queryToMessage(
+	messageb *protobuilder.MessageBuilder,
+	q *query,
+) error {
+	for _, c := range q.i.Columns {
+		if handleSkip(c.Name, q.a.Skips) {
+			continue
+		}
+		// Append missing Columns from queries to Target
+		cName := protoreflect.Name(c.Name)
+		if messageb.GetField(cName) == nil {
+			t, err := p.convertType(c)
+			if err != nil {
+				return err
+			}
+			fieldb := protobuilder.NewField(cName, t)
+			if c.IsArray {
+				fieldb.SetRepeated()
+			}
+			if err := messageb.TryAddField(fieldb); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// lgetFD will reutrn a new empty FD if one does not exist
+func (p Protos) getFD(a *Annotations) *protobuilder.FileBuilder {
+	op := fpath(a.FullPath)
+	if p.files[op] == nil {
+		file := protobuilder.NewFile("")
+		file.SetSyntax(protoreflect.Proto3)
+		file.SetPath(a.FullPath)
+		file.SetPackageName(protoreflect.FullName(a.Package))
+		p.files[op] = file
+
+	}
+	return p.files[op]
+}
+
+// Responsible for Constructing message.proto
+func (p Protos) Messages() error {
+	for _, t := range p.tables {
+		fb := p.getFD(t.a)
+
+		if err := p.tableToMessage(fb, t); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (p Protos) Queries() error {
+	for _, q := range p.queries {
+		mb, err := p.GetMessage(protoreflect.Name(*toPascal(q.a.Target)))
+		if err != nil {
+			return err
+		}
+		if err := p.queryToMessage(mb, q); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (p Protos) appendFieldsToMessage(
+	desc *descriptorpb.DescriptorProto,
+	b *protobuilder.MessageBuilder,
+) error {
+	for _, uf := range desc.GetField() {
+		var fType *protobuilder.FieldType
+		if b.GetField(protoreflect.Name(*uf.Name)) != nil {
+			continue
+		}
+		if uf.Type != nil {
+			ft, err := p.convertType(uf.Type.String())
+			if err != nil {
+				return err
+			}
+			fType = ft
+		} else {
+			if uf.TypeName != nil {
+				ft, err := p.convertType(userDefinedString(uf.TypeName))
+				if err != nil {
+					return err
+				}
+				fType = ft
+			}
+		}
+		b.AddField(protobuilder.NewField(
+			protoreflect.Name(*uf.Name),
+			fType,
+		))
+	}
+
+	return nil
+}
+
+func (p Protos) appendMethodsToService(
+	desc *descriptorpb.ServiceDescriptorProto,
+	b *protobuilder.ServiceBuilder,
+) error {
+	for _, mm := range desc.GetMethod() {
+		if b.GetMethod(protoreflect.Name(*mm.Name)) != nil {
+			continue
+		}
+		itb, err := p.GetMessage(protoreflect.Name(*mm.InputType))
+		if err != nil {
+			return err
+		}
+		otb, err := p.GetMessage(protoreflect.Name(*mm.OutputType))
+		if err != nil {
+			return err
+		}
+		reqb := protobuilder.RpcTypeMessage(itb, false)
+		respb := protobuilder.RpcTypeMessage(otb, false)
+
+		nmb := protobuilder.NewMethod(protoreflect.Name(*mm.Name), reqb, respb)
+		nmb.SetOptions(mm.Options)
+
+		if err := b.TryAddMethod(nmb); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (p Protos) appendValuesToEnum(
+	desc *descriptorpb.EnumDescriptorProto,
+	b *protobuilder.EnumBuilder,
+) error {
+	for _, em := range desc.GetValue() {
+		if b.GetValue(protoreflect.Name(*em.Name)) != nil {
+			continue
+		}
+		evb := protobuilder.NewEnumValue(protoreflect.Name(*em.Name))
+		if err := b.TryAddValue(evb); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// Always sorts enum.proto, message.proto, request_response.proto, service.proto
+func (p Protos) GetFiles() []*protobuilder.FileBuilder {
+	var filesSlice Protofiles
+
+	for _, f := range p.files {
+		filesSlice = append(filesSlice, f)
+	}
+
+	sort.Sort(filesSlice)
+
+	return filesSlice
+}
+
+func (p Protos) UserDefined() error {
+	for _, file := range p.GetFiles() {
+		mp := fmt.Sprintf("%s/%s", p.options.UserDefinedDir, file.Path())
+
+		if _, err := os.Stat(mp); err != nil {
+			continue
+		}
+		mFile, err := os.Open(mp)
+		if err != nil {
+			return err
+		}
+		filename := filepath.Base(mp)
+		node, err := parser.Parse(filename, mFile, reporter.NewHandler(nil))
+		if err != nil {
+			return err
+		}
+		result, err := parser.ResultFromAST(node, false, reporter.NewHandler(nil))
+		if err != nil {
+			return err
+		}
+		udFile := result.FileDescriptorProto()
+
+		// Enums
+		for _, ue := range udFile.GetEnumType() {
+			e := file.GetEnum(protoreflect.Name(*ue.Name))
+			if e == nil {
+				neb := protobuilder.NewEnum(protoreflect.Name(*ue.Name))
+				if err := p.appendValuesToEnum(ue, neb); err != nil {
+					return err
+				}
+				if err := file.TryAddEnum(neb); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := p.appendValuesToEnum(ue, e); err != nil {
+				return err
+			}
+		}
+
+		// Messaages
+		for _, um := range udFile.GetMessageType() {
+			m := file.GetMessage(protoreflect.Name(*um.Name))
+			if m == nil {
+				nmb := protobuilder.NewMessage(protoreflect.Name(*um.Name))
+				if err := p.appendFieldsToMessage(um, nmb); err != nil {
+					return err
+				}
+				if err := file.TryAddMessage(nmb); err != nil {
+					return err
+				}
+				continue
+			}
+
+			if err := p.appendFieldsToMessage(um, m); err != nil {
+				return err
+			}
+		}
+
+		// Services
+		for _, sm := range udFile.GetService() {
+			s := file.GetService(protoreflect.Name(*sm.Name))
+			if s == nil {
+				nsb := protobuilder.NewService(protoreflect.Name(*sm.Name))
+				if err := p.appendMethodsToService(sm, nsb); err != nil {
+					return err
+				}
+				if err := file.TryAddService(nsb); err != nil {
+					return err
+				}
+				// make new service
+				continue
+			}
+			if err := p.appendMethodsToService(sm, s); err != nil {
+				return err
+			}
+
+		}
+	}
+
+	return nil
+}
+
+func (p Protos) GetMessage(name protoreflect.Name) (*protobuilder.MessageBuilder, error) {
+	for _, file := range p.files {
+		m := file.GetMessage(name)
+		if m == nil {
+			continue
+		}
+		return m, nil
+	}
+
+	return nil, fmt.Errorf("%q: Message Not Found.", name)
+}
+
+// Responsible for Creating enum.proto files
+func (p Protos) Enums() error {
+	for _, enum := range p.enums {
+		pn := *toPascal(enum.i.Name)
+		fb := p.getFD(enum.a)
+		eName := protoreflect.Name(pn)
+
+		eb := protobuilder.NewEnum(eName)
+
+		vals := convertEnumValues(pn, enum.i.Vals)
+		for _, val := range vals {
+			vName := protoreflect.Name(val)
+			if err := eb.TryAddValue(protobuilder.NewEnumValue(vName)); err != nil {
+				return err
+			}
+		}
+		if err := fb.TryAddEnum(eb); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (p Protos) WriteFiles() error {
+	fdSlice := []protoreflect.FileDescriptor{}
+	printer := protoprint.Printer{}
+	for _, file := range p.files {
+		b, err := file.Build()
+		if err != nil {
+			return err
+		}
+
+		fdSlice = append(fdSlice, b)
+	}
+
+	if err := os.MkdirAll(p.options.OutDir, os.ModePerm); err != nil {
+		return err
+	}
+	if err := printer.PrintProtosToFileSystem(fdSlice, p.options.OutDir); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+type Annotations struct {
+	Generate bool   // All:   Generate Protos.
+	Package  string // All: Package Name.
+	// Replace  map[string]PType    // Tables -> Messages: Type Replacement
+	Skips    []string // Tables -> Messages: Skip Field
+	ReqResp  *ReqResp // Tables -> Messaes:  Information for generating Request and Responses
+	Service  *Service // Tables -> Messaes:  Information for generating Services
+	Target   string   // Applies only to querys
+	FileName string   // Override output filename
+	OutDir   string   // Override base output directory
+
+	FullPath     string // Generated from Package + FilenName
+	FullTypeName string // Generated from Package + FilenName
+	OutputPath   string // Generated from OutDir + FullPath
+	PrimaryKey   string
+}
+
+// enumWrapper attaches parsed comment Annotations for plugin.Enum
+type enum struct {
+	i *plugin.Enum
+	a *Annotations
+}
+
+// queryWrapper attaches parsed comment Annotations to plugin.Query
+type query struct {
+	i *plugin.Query
+	a *Annotations
+}
+
+// tableWrapper attaches parsed comment Annotations to plugin.Table
+type table struct {
+	i *plugin.Table
+	a *Annotations
+}
+
+func wrapTable(i *plugin.Table) (*table, error) {
+	a, err := parseAnnotations(i.RawComments)
+	if err != nil {
+		return nil, err
+	}
+	x := &table{
+		i: i,
+		a: a,
+	}
+
+	if err := setProps(x); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+func wrapQuery(i *plugin.Query) (*query, error) {
+	a, err := parseAnnotations(i.RawComments)
+	if err != nil {
+		return nil, err
+	}
+	x := &query{
+		i: i,
+		a: a,
+	}
+	if err := setProps(x); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+func wrapEnum(i *plugin.Enum) (*enum, error) {
+	a, err := parseAnnotations(i.RawComments)
+	if err != nil {
+		return nil, err
+	}
+	x := &enum{
+		i: i,
+		a: a,
+	}
+	if err := setProps(x); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+func (p *Protos) run(req *plugin.GenerateRequest) error {
+
+	schemas := req.GetCatalog().GetSchemas()
+	queries := req.GetQueries()
+
+	for _, schema := range schemas {
+		if schema.Name == "pg_catalog" || schema.Name == "information_schema" {
+			continue
+		}
+		// enums = append(enums, schema.GetEnums()...)
+		for _, table := range schema.GetTables() {
+			t, err := wrapTable(table)
+			if err != nil {
+				if err.Error() == DO_NOT_GENERATE {
+					continue
+				}
+				return err
+			}
+			p.tables = append(p.tables, t)
+		}
+		for _, enum := range schema.GetEnums() {
+			e, err := wrapEnum(enum)
+			if err != nil {
+				if err.Error() == DO_NOT_GENERATE {
+					continue
+				}
+				return err
+			}
+			p.enums = append(p.enums, e)
+		}
+	}
+
+	for _, query := range queries {
+		q, err := wrapQuery(query)
+		if err != nil {
+			if err.Error() == DO_NOT_GENERATE {
+				continue
+			}
+			return err
+		}
+		p.queries = append(p.queries, q)
+	}
+
+	if err := p.Enums(); err != nil {
+		return err
+	}
+	if err := p.Messages(); err != nil {
+		return err
+	}
+	if err := p.Queries(); err != nil {
+		return err
+	}
+
+	if err := p.UserDefined(); err != nil {
+		return err
+	}
+
+	if err := p.WriteFiles(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func parseAnnotations(comments []string) (*Annotations, error) {
+	// replace := make(map[string]PType)
+	a := &Annotations{
+		// Replace: replace,
 	}
 
 	for _, line := range comments {
@@ -202,6 +992,7 @@ func getGenerateOpts(comments []string) (*generateOpts, error) {
 		}
 		for _, flagOpt := range []string{
 			"generate",
+			"service",
 		} {
 			if !strings.HasPrefix(strings.TrimSpace(rest), flagOpt) {
 				continue
@@ -211,16 +1002,21 @@ func getGenerateOpts(comments []string) (*generateOpts, error) {
 			if !strings.HasPrefix(rest, opt) {
 				return nil, fmt.Errorf("invalid metadata: %s", line)
 			}
-			g.Generate = true
+			switch flagOpt {
+			case "generate":
+				a.Generate = true
+			case "service":
+			}
 		}
 
 		for _, cmdOption := range []string{
 			"package",
 			"replace",
-			"outdir",
 			"filename",
-			"messagename",
+			"target",
 			"skip",
+			"request_response",
+			"service",
 		} {
 			if !strings.HasPrefix(strings.TrimSpace(rest), cmdOption) {
 				continue
@@ -239,27 +1035,14 @@ func getGenerateOpts(comments []string) (*generateOpts, error) {
 					return nil, fmt.Errorf("-- package: <package>... takes exactly 1 argument")
 				}
 				packageName := part[2]
-				g.Package = packageName
-			case "outdir":
-				if len(part) != 3 {
-					return nil, fmt.Errorf("-- outdir: <outdir>... takes exactly 1 argument")
-				}
-				outdir := part[2]
-				g.OutputDirectory = outdir
-			case "filename":
-				if len(part) != 3 {
-					return nil, fmt.Errorf("-- filename: <filename>... takes exactly 1 argument")
-				}
-				fileName := part[2]
-				g.FileName = fileName
-			case "messagename":
+				a.Package = packageName
+			case "target":
 				if len(part) != 3 {
 					return nil, fmt.Errorf(
-						"-- messagename: <messagename>... takes exactly 1 argument",
+						"-- target: <target>... takes exactly 1 argument",
 					)
 				}
-				msgName := part[2]
-				g.MessageName = msgName
+				a.Target = part[2]
 			case "skip":
 				if len(part) != 3 {
 					return nil, fmt.Errorf(
@@ -267,511 +1050,229 @@ func getGenerateOpts(comments []string) (*generateOpts, error) {
 					)
 				}
 				skipField := part[2]
-				g.Skip = append(g.Skip, skipField)
-			case "replace":
-				if len(part) != 5 {
+				a.Skips = append(a.Skips, skipField)
+			case "request_response":
+				if len(part) < 3 {
 					return nil, fmt.Errorf(
-						"-- replace: <column> <import> <type> ... takes exactly 3 argument",
+						"-- request_response: takes at minimum 2 argument",
 					)
 				}
-				columnName := part[2]
-				importPath := part[3]
-				typeName := part[4]
-				g.Replace[columnName] = protoType{
-					ImportPath: importPath,
-					Name:       typeName,
+				if a.ReqResp == nil {
+					es := []string{}
+					a.ReqResp = &ReqResp{
+						OneOf:     &es,
+						ReqFields: make(map[string]string),
+						RespEmpty: make(map[string]bool),
+					}
+				}
+				switch part[2] {
+				case "oneof":
+					if len(part) >= 5 {
+						*a.ReqResp.OneOf = append(*a.ReqResp.OneOf, part[3:]...)
+					}
+					if len(part) == 3 {
+						emptySlice := []string{}
+						a.ReqResp.OneOf = &emptySlice
+					}
+				case "req_field":
+					if len(part) != 5 {
+						return nil, fmt.Errorf(
+							"-- request_response: req_field <type> <name> takes exactly 2 arguments.",
+						)
+					}
+					a.ReqResp.ReqFields = make(map[string]string)
+					a.ReqResp.ReqFields[part[3]] = part[4]
+					// a.ReqResp = rr
+				case "resp_empty":
+					if len(part) != 4 {
+						return nil, fmt.Errorf(
+							"-- request_response: resp_empty <method> takes exactly 1 arguments.",
+						)
+					}
+					a.ReqResp.RespEmpty = make(map[string]bool)
+					a.ReqResp.RespEmpty[part[3]] = true
+				}
+			case "service":
+				if len(part) != 4 {
+					return nil, fmt.Errorf(
+						"-- service: <name> <path> ... takes exactly 2 argument",
+					)
+				}
+				name := part[2]
+				path := part[3]
+				p, err := url.Parse(path)
+				if err != nil {
+					return nil, err
+				}
+				a.Service = &Service{
+					Path: p,
+					Name: name,
 				}
 			}
 		}
 	}
 
-	return g, nil
+	return a, nil
 }
 
-type headerInput struct {
-	PackageName string
-	Imports     map[string]string
-}
-
-type msgInput struct {
-	Name   string
-	Fields fields
-}
-
-type enumInput struct {
-	Name   string
-	Values []string
-}
-
-type protofiles map[string]*protofile
-
-type message struct {
-	name   string
-	fields map[string]*field
-	skip   map[string]bool
-}
-
-type enum struct {
-	name   string
-	values []string
-}
-
-type protofile struct {
-	headerBuf       *bytes.Buffer
-	msgsBuf         *bytes.Buffer
-	enumsBuf        *bytes.Buffer
-	messages        map[string]*message
-	enums           map[string]*enum
-	folderPath      string
-	packagename     string
-	filename        string
-	requiredImports map[string]string
-	fullpath        string
+func toImportPath(pkg string, filename string) string {
+	return fmt.Sprintf("%s/%s", pkgToPath(pkg), filename)
 }
 
 func pkgToPath(s string) string {
+	// validate against protected type names in importsl
 	return strings.ReplaceAll(s, ".", "/")
 }
 
-// func addToMsgProtoFiles(comments []string, columns *)
-func (g *generator) appendProtos(
-	input interface{},
-) error {
-	switch v := input.(type) {
-	case *plugin.Table:
-		o, err := getGenerateOpts(v.RawComments)
-		if !o.Generate {
-			break
-		}
-		if err != nil {
-			return err
-		}
-		if o.MessageName == "" {
-			o.MessageName = protoName(v.Rel.Name)
-		}
-		opts, err := setOptDefaults(o, false, "message.proto")
-		if err != nil {
-			return err
-		}
-		err = g.assembleProto(opts, v.Columns, nil)
-		if err != nil {
-			return err
-		}
-	case *plugin.Query:
-		o, err := getGenerateOpts(v.RawComments)
-		if !o.Generate {
-			break
-		}
-		if err != nil {
-			return err
-		}
-		opts, err := setOptDefaults(o, true, "messsage.proto")
-		if err != nil {
-			return err
-		}
-		err = g.assembleProto(opts, v.Columns, nil)
-		if err != nil {
-			return err
-		}
-	case *plugin.Enum:
-		o, err := getGenerateOpts(v.RawComments)
-		if !o.Generate {
-			break
-		}
-		if err != nil {
-			return err
-		}
-		if o.EnumName == "" {
-			o.EnumName = protoName(v.Name)
-		}
-		opts, err := setOptDefaults(o, false, "enum.proto")
-		if err != nil {
-			return err
-		}
-		err = g.assembleProto(opts, nil, v)
-		if err != nil {
-			return err
+func validatePackageName(s string) error {
+	tokens := strings.Split(s, ".")
+	for _, reserved := range []string{"enum", "message", "import", "syntax", "repeated"} {
+		if len(tokens) > 0 {
+			if tokens[0] == reserved {
+				return fmt.Errorf(
+					"%q: is a reserved word and cannot be used as first part in package: %q",
+					tokens[0],
+					s,
+				)
+			}
 		}
 	}
 
 	return nil
 }
 
-func (g *generator) assembleProto(
-	opts *generateOpts,
-	columns []*plugin.Column,
-	e *plugin.Enum,
-) error {
-	if !opts.Generate {
-		return nil
-	}
-	pf := g.buildProtoFile(opts)
-	if e != nil {
-		g.handleEnum(opts, e)
-	}
-	if len(columns) > 0 {
-		g.handleMsg(opts, columns, pf)
-	}
-
-	return nil
-}
-
-func setOptDefaults(
-	opts *generateOpts,
-	query bool,
-	filename string,
-) (*generateOpts, error) {
-	// Handle Empty Options with Defaults
-	if opts.Package == "" {
-		opts.Package = "sqlcgen"
-	}
-	if opts.OutputDirectory == "" {
-		opts.OutputDirectory = "sqlcgen"
-	}
-	if opts.FileName == "" {
-		opts.FileName = filename
-	}
-	if query && opts.MessageName == "" {
-		return nil, fmt.Errorf(
-			"Queries that want to generate protobufs must declare a messagename: <messagename>",
-		)
-	}
-
-	return opts, nil
-}
-
-func (g *generator) buildProtoFile(opts *generateOpts) *protofile {
-	// Build File
-	header := bytes.Buffer{}
-	msgs := bytes.Buffer{}
-	enums := bytes.Buffer{}
-	folderpath := opts.OutputDirectory + "/" + pkgToPath(opts.Package)
-	pf := &protofile{
-		headerBuf:       &header,
-		msgsBuf:         &msgs,
-		enumsBuf:        &enums,
-		folderPath:      folderpath,
-		packagename:     opts.Package,
-		filename:        opts.FileName,
-		fullpath:        folderpath + "/" + opts.FileName,
-		requiredImports: make(map[string]string),
-		messages:        make(map[string]*message),
-		enums:           make(map[string]*enum),
-	}
-
-	if g.protofiles[opts.Package] == nil {
-		g.protofiles[opts.Package] = pf
-	}
-
-	return pf
-}
-
-func (g *generator) handleImports(c *plugin.Column, opts *generateOpts, pf *protofile) string {
-	replace, ok := opts.Replace[c.Name]
-	if ok {
-		if requiredImport(replace.Name) {
-			pf.requiredImports[replace.Name] = replace.ImportPath
-		}
-		return replace.Name
-	}
-
-	// If we don't find a type it may be because its an enum
-	ptype := pgTypeToProtoType(c)
-	if ptype == "unknown" {
-		pn := protoName(c.Type.Name)
-		for name, pro := range g.protofiles {
-			if g.protofiles[name].enums[pn] != nil {
-				ptype = name + "." + pn
-				pf.requiredImports[ptype] = pkgToPath(name) + "/" + pro.filename
-			}
-		}
-		return ptype
-	}
-
-	if requiredImport(ptype) {
-		pf.requiredImports[ptype] = protoTypeMap[ptype]
-	}
-
-	return ptype
-}
-
-func (g *generator) handleMsg(opts *generateOpts, columns []*plugin.Column, pf *protofile) {
-	opts.MessageName = protoName(opts.MessageName)
-
-	if g.protofiles[opts.Package].messages[opts.MessageName] == nil {
-		msg := &message{
-			name:   opts.MessageName,
-			fields: make(map[string]*field),
-			skip:   make(map[string]bool),
-		}
-		g.protofiles[opts.Package].messages[opts.MessageName] = msg
-	}
-
-	for _, s := range opts.Skip {
-		g.protofiles[opts.Package].messages[opts.MessageName].skip[s] = true
-	}
-
-	for _, c := range columns {
-		if g.protofiles[opts.Package].messages[opts.MessageName].skip[c.Name] {
-			continue
-		}
-		f := field{}
-		f.PrimaryKey = c.PrimaryKey
-		f.IsArray = c.IsArray
-		f.Name = fieldName(c.Name)
-		f.Type = g.handleImports(c, opts, pf)
-
-		// Build Field
-		if g.protofiles[opts.Package].messages[opts.MessageName].fields[f.Name] == nil {
-			g.protofiles[opts.Package].messages[opts.MessageName].fields[f.Name] = &f
-		}
-	}
-}
-
-func (g *generator) handleEnum(opts *generateOpts, e *plugin.Enum) {
-	opts.EnumName = protoName(opts.EnumName)
-	if g.protofiles[opts.Package].enums[opts.EnumName] == nil {
-		en := &enum{
-			name:   opts.EnumName,
-			values: enumName(opts.EnumName, e.Vals),
-		}
-		g.protofiles[opts.Package].enums[opts.EnumName] = en
-	}
-
-}
-
-func enumName(n string, s []string) []string {
-	u := strcase.ToSNAKE(n)
-	x := []string{u + "_UNSPECIFIED"}
-	for _, z := range s {
-		y := strcase.ToSNAKE(z)
-		x = append(x, (u + "_" + y))
-	}
-	return x
-}
-
-type generator struct {
-	protofiles map[string]*protofile
-}
-
-func run() error {
-	var req plugin.GenerateRequest
-	reqBlob, err := io.ReadAll(os.Stdin)
-	if err != nil {
-		return err
-	}
-	if err := proto.Unmarshal(reqBlob, &req); err != nil {
-		return err
-	}
-
-	protofiles := make(map[string]*protofile)
-	g := &generator{
-		protofiles: protofiles,
-	}
-
-	// Schema must be first because we only append columns to the map[string]*field
-	// queries that don't already exist.  Fields on *plugin.Column aren't
-	// parsed in queries.
-	schemas := req.Catalog.GetSchemas()
-	for _, s := range schemas {
-		if s.Name == "pg_catalog" || s.Name == "information_schema" {
-			continue
-		}
-
-		// Enums must go first,  because schema tables will match against
-		// those types
-		enums := s.GetEnums()
-		for _, e := range enums {
-			if err := g.appendProtos(e); err != nil {
-				return err
-			}
-		}
-
-		tables := s.GetTables()
-		for _, t := range tables {
-			if err := g.appendProtos(t); err != nil {
-				return err
-			}
-		}
-
-	}
-
-	// Queries can be added to the .proto,  Column data like "primarykey"
-	queries := req.GetQueries()
-	for _, query := range queries {
-		if err := g.appendProtos(query); err != nil {
-			return err
-		}
-
-	}
-
-	for pkg, output := range protofiles {
-		header := output.headerBuf
-		msgs := output.msgsBuf
-		enums := output.enumsBuf
-
-		if err := headerTmpl.Execute(header, &headerInput{
-			PackageName: pkg,
-			Imports:     output.requiredImports,
-		}); err != nil {
-			return err
-		}
-
-		for name, message := range output.messages {
-			// Need maps to be determinsitic
-			sortedFields := make(fields, 0, len(message.fields))
-			for _, f := range message.fields {
-				sortedFields = append(sortedFields, *f)
-			}
-			sort.Sort(sortedFields)
-
-			if err := msgTmpl.Execute(msgs, &msgInput{
-				Name:   name,
-				Fields: sortedFields,
-			}); err != nil {
-				return err
-			}
-		}
-
-		for name, e := range output.enums {
-			if err := enumTmpl.Execute(enums, &enumInput{
-				Name:   name,
-				Values: e.values,
-			}); err != nil {
-				return err
-			}
-		}
-
-		if _, err := os.Stat(output.folderPath); err != nil {
-			if err := os.MkdirAll(output.folderPath, os.ModePerm); err != nil {
-				return err
-			}
-		}
-
-		// If the file doesn't exist, create it, or append to the file
-		f, err := os.Create(output.folderPath + "/" + output.filename)
-		if err != nil {
-			return err
-		}
-
-		//  Append Syntax, Package, []import
-		_, err = f.Write(header.Bytes())
-		if err != nil {
-			return err
-		}
-
-		// Append Messages to .protofile
-		if len(output.messages) > 0 {
-			_, err = f.Write(msgs.Bytes())
-			if err != nil {
-				return err
-			}
-		}
-
-		// Append Messages to .protofile
-		if len(output.enums) > 0 {
-			_, err = f.Write(enums.Bytes())
-			if err != nil {
-				return err
-			}
-		}
-
-		if err := f.Close(); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-type field struct {
-	Name       string
-	Type       string
-	IsArray    bool
-	PrimaryKey bool
-}
-
-type fields []field
-
-func (f fields) Len() int {
-	return len(f)
-}
-
-func (f fields) Swap(i, j int) {
-	f[i], f[j] = f[j], f[i]
-}
-
-func (f fields) Less(i, j int) bool {
-	// Always put "primarykey" first
-	if f[i].PrimaryKey {
-		return true
-	}
-	if f[j].PrimaryKey {
-		return false
-	}
-	// Otherwise, sort alphabetically by Name
-	return f[i].Name < f[j].Name
-}
-
-func protoName(s string) string {
+func toPascal(s string) *string {
 	r := strings.ToLower(s)
 	r = strcase.ToPascal(s)
 
-	return r
+	return &r
 }
 
-func fieldName(s string) string {
+func toLowerSnake(s string) *string {
 	s = strings.ToLower(s)
 	s = strcase.ToSnake(s)
-	return s
+	return &s
 }
 
-func requiredImport(s string) bool {
-	switch s {
-	case protoDouble:
-		return false
-	case protoFloat:
-		return false
-	case protoInt32:
-		return false
-	case protoInt64:
-		return false
-	case protoUint32:
-		return false
-	case protoUint64:
-		return false
-	case protoSint32:
-		return false
-	case protoSint64:
-		return false
-	case protoFixed32:
-		return false
-	case protoFixed64:
-		return false
-	case protoSFixed32:
-		return false
-	case protoSFixed64:
-		return false
-	case protoBool:
-		return false
-	case protoString:
-		return false
-	case protoBytes:
-		return false
+func setCommonProps(a *Annotations) error {
+	if a.Package == "" {
+		a.Package = DEFAULT_DEFAULT_PACKAGE
 	}
 
-	return true
+	if err := validatePackageName(a.Package); err != nil {
+		return err
+	}
+
+	if a.OutDir == "" {
+		a.OutDir = DEFAULT_OUTDIR
+	}
+	// Example Package: foo.bar.baz.v1
+	// Example Filename: message.proto
+	// Path relative from root: foo/bar/baz/v1/message.proto
+	a.FullPath = fmt.Sprintf("%s/%s", pkgToPath(a.Package), a.FileName)
+
+	// Example Package: foo.bar.baz.v1
+	// Example Filename: message.proto
+	// Path relative from root: foo/bar/baz/v1/message.proto
+	// a.FullTypeName = fmt.Sprintf("%s.%s", a.Package, a.FileName)
+
+	// Full Filesystem path to be written to
+	a.OutputPath = fmt.Sprintf("%s/%s", a.OutDir, a.FullPath)
+
+	return nil
 }
 
-// Type, NotFound
-func pgTypeToProtoType(col *plugin.Column) string {
-	columnType := sdk.DataType(col.Type)
-	notNull := col.NotNull || col.IsArray
-	// driver := parseDriver(options./*  */SqlPackage)
+func setProps(input interface{}) error {
+	switch i := input.(type) {
+	case *query:
+		if !i.a.Generate {
+			return fmt.Errorf(DO_NOT_GENERATE)
+		}
+		if i.a.Target == "" {
+			return fmt.Errorf(
+				"To append columns from Queries to protobufs  you must declare a target: <message-to-append-to>",
+			)
 
-	columnType = strings.ToLower(columnType)
+		}
+		if err := setCommonProps(i.a); err != nil {
+			return err
+		}
+	case *enum:
+		if !i.a.Generate {
+			return fmt.Errorf(DO_NOT_GENERATE)
+		}
+		if i.a.FileName == "" {
+			i.a.FileName = "enum.proto"
+		}
+		if err := setCommonProps(i.a); err != nil {
+			return err
+		}
+	case *table:
+		if !i.a.Generate {
+			return fmt.Errorf(DO_NOT_GENERATE)
+		}
+		if i.a.FileName == "" {
+			i.a.FileName = "message.proto"
+		}
+		if err := setCommonProps(i.a); err != nil {
+			return err
+		}
+	case *ReqResp:
+		if !i.a.Generate {
+			return fmt.Errorf(DO_NOT_GENERATE)
+		}
+		if i.a.FileName == "" {
+			i.a.FileName = "request_response.proto"
+		}
+		if err := setCommonProps(i.a); err != nil {
+			return err
+		}
+	case *Service:
+		if !i.a.Generate {
+			return fmt.Errorf(DO_NOT_GENERATE)
+		}
+		if i.a.FileName == "" {
+			i.a.FileName = "service.proto"
+		}
+		if err := setCommonProps(i.a); err != nil {
+			return err
+		}
+	}
 
-	switch columnType {
+	return nil
+}
+
+type userDefinedString *string
+
+func (p *Protos) convertType(input interface{}) (*protobuilder.FieldType, error) {
+	var ct string
+	var notNull bool
+
+	switch i := input.(type) {
+	case string:
+		ct = i
+		notNull = true
+	case userDefinedString:
+		ct = *i
+	case *plugin.Column:
+		s := sdk.DataType(i.Type)
+		notNull = i.NotNull || i.IsArray
+		ct = strings.ToLower(s)
+	}
+
+	tAny := (*anypb.Any)(nil).ProtoReflect().Descriptor()
+	tI32 := (*wrapperspb.Int32Value)(nil).ProtoReflect().Descriptor()
+	tI64 := (*wrapperspb.Int64Value)(nil).ProtoReflect().Descriptor()
+	tFloat := (*wrapperspb.FloatValue)(nil).ProtoReflect().Descriptor()
+	tBytes := (*wrapperspb.BytesValue)(nil).ProtoReflect().Descriptor()
+	tBool := (*wrapperspb.BoolValue)(nil).ProtoReflect().Descriptor()
+	tString := (*wrapperspb.StringValue)(nil).ProtoReflect().Descriptor()
+	tDecimal := (*decimal.Decimal)(nil).ProtoReflect().Descriptor()
+	tMoney := (*money.Money)(nil).ProtoReflect().Descriptor()
+	tStruct := (*structpb.Struct)(nil).ProtoReflect().Descriptor()
+	tTimestamp := (*timestamppb.Timestamp)(nil).ProtoReflect().Descriptor()
+
+	switch ct {
 	// Int32
 	case "integer",
 		"int",
@@ -782,11 +1283,14 @@ func pgTypeToProtoType(col *plugin.Column) string {
 		"pg_catalog.serial4",
 		"smallserial",
 		"smallint", "int2", "pg_catalog.int2", "serial2",
-		"pg_catalog.serial2":
+		"pg_catalog.serial2",
+		WellKnownInt32Value:
 		if notNull {
-			return protoInt32
+			return protobuilder.FieldTypeInt32(), nil
 		}
-		return WellKnownInt32Value
+		return protobuilder.FieldTypeImportedMessage(
+			tI32,
+		), nil
 
 	// Int64
 	case "interval",
@@ -796,11 +1300,15 @@ func pgTypeToProtoType(col *plugin.Column) string {
 		"pg_catalog.int8",
 		"bigserial",
 		"serial8",
-		"pg_catalog.serial8":
+		"pg_catalog.serial8",
+		"TYPE_INT64",
+		WellKnownInt64Value:
 		if notNull {
-			return protoInt64
+			return protobuilder.FieldTypeInt64(), nil
 		}
-		return WellKnownInt64Value
+		return protobuilder.FieldTypeImportedMessage(
+			tI64,
+		), nil
 
 	// Float
 	case "real",
@@ -809,40 +1317,58 @@ func pgTypeToProtoType(col *plugin.Column) string {
 		"float",
 		"double precision",
 		"float8",
-		"pg_catalog.float8":
+		"pg_catalog.float8",
+		"TYPE_DOUBLE",
+		"TYPE_FLOAT",
+		WellKnownFloatValue:
 		if notNull {
-			return protoFloat
+			return protobuilder.FieldTypeFloat(), nil
 		}
-		return WellKnownFloatValue
+		return protobuilder.FieldTypeImportedMessage(
+			tFloat,
+		), nil
 
-	case "numeric", "pg_catalog.numeric":
-		return WellKnownDecimal
+	case "numeric", "pg_catalog.numeric", WellKnownDecimal:
+		return protobuilder.FieldTypeImportedMessage(
+			tDecimal,
+		), nil
 
-	case "money":
-		return WellKnownMoney
+	case "money", WellKnownMoney:
+		return protobuilder.FieldTypeImportedMessage(
+			tMoney,
+		), nil
 
-	case "boolean", "bool", "pg_catalog.bool":
+	case "boolean", "bool", "pg_catalog.bool", WellKnownBoolValue:
 		if notNull {
-			return protoBool
+			return protobuilder.FieldTypeBool(), nil
 		}
-		return WellKnownBoolValue
+		return protobuilder.FieldTypeImportedMessage(
+			tBool,
+		), nil
 
-	case "json":
-		return WellKnownStruct
+	case "json", WellKnownStruct:
+		return protobuilder.FieldTypeImportedMessage(
+			tStruct,
+		), nil
 
-	case "uuid", "jsonb", "bytea", "blob", "pg_catalog.bytea":
+	case "uuid", "jsonb", "bytea", "blob", "pg_catalog.bytea", WellKnownBytesValue:
 		if notNull {
-			return protoBytes
+			return protobuilder.FieldTypeBytes(), nil
 		}
-		return WellKnownBytesValue
+		return protobuilder.FieldTypeImportedMessage(
+			tBytes,
+		), nil
 
 	case "pg_catalog.timestamptz",
 		"date",
 		"timestamptz",
 		"pg_catalog.timestamp",
 		"pg_catalog.timetz",
-		"pg_catalog.time":
-		return WellKnownTimestamp
+		"pg_catalog.time",
+		WellKnownTimestamp:
+		return protobuilder.FieldTypeImportedMessage(
+			tTimestamp,
+		), nil
 
 	case "citext",
 		"lquery",
@@ -856,11 +1382,14 @@ func pgTypeToProtoType(col *plugin.Column) string {
 		"pg_catalog.bpchar",
 		"pg_catalog.varchar",
 		"string",
-		"text":
+		"text",
+		WellKnownStringValue:
 		if notNull {
-			return protoString
+			return protobuilder.FieldTypeString(), nil
 		}
-		return WellKnownStringValue
+		return protobuilder.FieldTypeImportedMessage(
+			tString,
+		), nil
 
 	// All these PG Range Types Required FieldOptions
 	// Handle this Later
@@ -976,7 +1505,9 @@ func pgTypeToProtoType(col *plugin.Column) string {
 		// if driver.IsPGX() {
 		// 	return "pgtype.Hstore"
 		// }
-		return WellKnownAny
+		return protobuilder.FieldTypeImportedMessage(
+			tAny,
+		), nil
 
 	case "bit", "varbit", "pg_catalog.bit", "pg_catalog.varbit":
 		// if driver == opts.SQLDriverPGXV5 {
@@ -1058,18 +1589,191 @@ func pgTypeToProtoType(col *plugin.Column) string {
 		// 		return "pgvector.Vector"
 		// 	}
 		// }
-		return "WARNING:not-implemented"
 
 	case "void":
 		// A void value can only be scanned into an empty interface.
-		return WellKnownAny
+		return protobuilder.FieldTypeImportedMessage(
+			tAny,
+		), nil
 
-	case "any":
-		return WellKnownAny
+	case "any", WellKnownAny:
+		return protobuilder.FieldTypeImportedMessage(
+			tAny,
+		), nil
 
+	// If we are here check for enum
 	default:
-		return "unknown"
+		tKind, err := stringToKind(ct)
+		if err == nil {
+			return protobuilder.FieldTypeScalar(tKind), nil
+		}
+
+		for _, f := range p.files {
+			// We have to handle for when UserDefined comes in with EnumType
+			// Ex:  foo.bar.baz.v1.$EnumType
+			ct = filepath.Base(pkgToPath(ct))
+			tName := protoreflect.Name(*toPascal(ct))
+			// Check for Enums
+			eb := f.GetEnum(tName)
+			if eb != nil {
+				return protobuilder.FieldTypeEnum(eb), nil
+			}
+			// Check For Messages
+			mb := f.GetMessage(tName)
+			if mb != nil {
+				return protobuilder.FieldTypeMessage(mb), nil
+			}
+		}
 	}
 
-	return "unknown"
+	return nil, fmt.Errorf("%s: Type Conversion Not Implemented.  Use --replace: or --skip:", ct)
 }
+
+func stringToKind(typeString string) (protoreflect.Kind, error) {
+	switch strings.ToUpper(typeString) {
+	case "TYPE_DOUBLE":
+		return protoreflect.DoubleKind, nil
+	case "TYPE_FLOAT":
+		return protoreflect.FloatKind, nil
+	case "TYPE_INT64":
+		return protoreflect.Int64Kind, nil
+	case "TYPE_UINT64":
+		return protoreflect.Uint64Kind, nil
+	case "TYPE_INT32":
+		return protoreflect.Int32Kind, nil
+	case "TYPE_FIXED64":
+		return protoreflect.Fixed64Kind, nil
+	case "TYPE_FIXED32":
+		return protoreflect.Fixed32Kind, nil
+	case "TYPE_BOOL":
+		return protoreflect.BoolKind, nil
+	case "TYPE_STRING":
+		return protoreflect.StringKind, nil
+	case "TYPE_GROUP":
+		return protoreflect.GroupKind, nil
+	case "TYPE_MESSAGE":
+		return protoreflect.MessageKind, nil
+	case "TYPE_BYTES":
+		return protoreflect.BytesKind, nil
+	case "TYPE_UINT32":
+		return protoreflect.Uint32Kind, nil
+	case "TYPE_ENUM":
+		return protoreflect.EnumKind, nil
+	case "TYPE_SFIXED32":
+		return protoreflect.Sfixed32Kind, nil
+	case "TYPE_SFIXED64":
+		return protoreflect.Sfixed64Kind, nil
+	case "TYPE_SINT32":
+		return protoreflect.Sint32Kind, nil
+	case "TYPE_SINT64":
+		return protoreflect.Sint64Kind, nil
+	// Add more cases for different types as needed
+	default:
+		return protoreflect.Kind(0), fmt.Errorf("unknown type: %s", typeString)
+	}
+}
+
+// Takes a EnumName and Values and PREFIXS them in the proto style
+// Example: ResourceType_UNSPECIFIED
+func convertEnumValues(n string, s []string) []string {
+	u := strcase.ToSNAKE(n)
+	x := []string{u + "_UNSPECIFIED"}
+	for _, z := range s {
+		y := strcase.ToSNAKE(z)
+		x = append(x, (u + "_" + y))
+	}
+	return x
+}
+
+type ReqResp struct {
+	OneOf     *[]string
+	ReqFields map[string]string
+	RespEmpty map[string]bool
+	a         *Annotations
+}
+
+type Service struct {
+	Path *url.URL
+	Name string
+	a    *Annotations
+}
+
+type httpOptions struct {
+	Method string
+	Body   string
+	Path   *url.URL
+}
+
+func parseDynamicPath(path string) []string {
+	// Split both the template and path into segments
+	pathParts := strings.Split(path, "/")
+
+	// Create a map to store parameter values
+	var params []string
+
+	// Regex to identify path parameters (enclosed in { })
+	re := regexp.MustCompile(`^{([^}]+)}$`)
+
+	for _, pathPart := range pathParts {
+		if matches := re.FindStringSubmatch(pathPart); len(matches) > 0 {
+			// If the path segment is a parameter (e.g., {org}), extract the name
+			paramName := matches[1]
+			params = append(params, paramName)
+		}
+	}
+
+	return params
+}
+
+const (
+	wkprefix = "google.protobuf."
+
+	// proto represents builtin types
+	protoDouble   = "double"
+	protoFloat    = "float"
+	protoInt32    = "int32"
+	protoInt64    = "int64"
+	protoUint32   = "uint32"
+	protoUint64   = "uint64"
+	protoSint32   = "sint32"
+	protoSint64   = "sint64"
+	protoFixed32  = "fixed32"
+	protoFixed64  = "fixed64"
+	protoSFixed32 = "sfixed32"
+	protoSFixed64 = "sfixed64"
+	protoBool     = "bool"
+	protoString   = "string"
+	protoBytes    = "bytes"
+
+	// well known represents google.proto. well known types
+	WellKnownAny              = wkprefix + "Any"
+	WellKnownBoolValue        = wkprefix + "BoolValue"
+	WellKnownBytesValue       = wkprefix + "BytesValue"
+	WellKnownDecimal          = wkprefix + "Decimal"
+	WellKnownDoubleValue      = wkprefix + "DoubleValue"
+	WellKnownDuration         = wkprefix + "Duration"
+	WellKnownEmpty            = wkprefix + "Empty"
+	WellKnownEnum             = wkprefix + "Enum"
+	WellKnownEnumValue        = wkprefix + "EnumValue"
+	WellKnownField            = wkprefix + "Field"
+	WellKnownFieldCardinality = wkprefix + "Field.Cardinality"
+	WellKnownFieldKind        = wkprefix + "Field.Kind"
+	WellKnownFieldMask        = wkprefix + "FieldMask"
+	WellKnownFloatValue       = wkprefix + "FloatValue"
+	WellKnownInt32Value       = wkprefix + "Int32Value"
+	WellKnownInt64Value       = wkprefix + "Int64Value"
+	WellKnownListValue        = wkprefix + "ListValue"
+	WellKnownMethod           = wkprefix + "Method"
+	WellKnownMixin            = wkprefix + "Mixin"
+	WellKnownMoney            = wkprefix + "Money"
+	WellKnownNullValue        = wkprefix + "NullValue"
+	WellKnownOption           = wkprefix + "Option"
+	WellKnownSourceContext    = wkprefix + "SourceContext"
+	WellKnownStringValue      = wkprefix + "StringValue"
+	WellKnownStruct           = wkprefix + "Struct"
+	WellKnownSyntax           = wkprefix + "Syntax"
+	WellKnownTimestamp        = wkprefix + "Timestamp"
+	WellKnownType             = wkprefix + "Type"
+	WellKnownUInt32Value      = wkprefix + "UInt32Value"
+	WellKnownUInt64Value      = wkprefix + "UInt64Value"
+)
