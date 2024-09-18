@@ -27,11 +27,26 @@ When developing middleware that calls into generated code from sqlc we ended up 
 #### -- generate:
 *"-- generate:"*  specifies if the table should be generated.
 
-#### -- package:
+#### -- package: <name>
 *"-- package:"*  specifies the package for the given protobuf file.
 
-#### -- skip:
+#### -- skip: <field>
 *"-- skip:"*  can be applied to a single field to indicate you'd like to not include it in the message.  By default all columns in both queries and tables are added. *can be annotated many times above 1 statement*
+#### -- request_response: oneof <field> <field> <field>
+*"-- request_response: oneof "*  is used for applying a oneof configuration to the get, update, delete messages.
+#### -- request_response: req_feild <field>
+*"-- request_response: req_field "*  is used for adding an additional field.  Sometimes APIs require a path.  Ex. /api/v1/orgs/{org}/projects/{project}/resources.  You'd want to add req_field twice to additional fields 
+#### -- service: <service> <path>
+*"-- serivce: path"*  is used for adding an service. The path is used to define what path to use for the google api http rules.
+
+Path: /v1/users :
+| method | path | http |
+| --------------- | --------------- | --------------- |
+| Create | /v1/users | POST |
+| Get | /v1/users/{$primarykey} | GET |
+| Update | /v1/users/{$primarykey} | PUT |
+| Delete | /v1/users/{$primarykey} | DELETE |
+| List | /v1/users | GET |
 
 #### SQL Plugin Config
 ```json
